@@ -558,13 +558,14 @@ def calc_maker_fee(price: float, contracts: int) -> float:
 def fetch_wallet_balance() -> float | None:
     try:
         data = kalshi_get("/portfolio/balance")
-        for key in ("balance", "cash_balance", "available_balance"):
+        for key in ("cash_balance", "available_balance", "balance"):
             raw = data.get(key)
             if raw is None:
                 continue
             val = float(raw)
             if val > 1000.0:
                 val = val / 100.0
+            log.debug(f"fetch_wallet_balance: using key '{key}' = ${val:.2f}")
             return val
         return None
     except Exception as e:
@@ -1782,6 +1783,44 @@ def build_telegram_dashboard() -> str:
     return "\n".join(lines)
 
 
+def build_balance_report() -> str:
+    cash_balance = fetch_wallet_balance()
+    trade_dollars = TRADE_AMOUNT_CENTS / 100
+
+    conn = sqlite3.connect(DB_PATH)
+    open_rows = conn.execute("""
+        SELECT entry_price, sell_target
+        FROM trades
+        WHERE exit_price IS NULL AND run_id = ?
+    """, (current_run_id,)).fetchall()
+    conn.close()
+
+    open_count = len(open_rows)
+    cost_basis = open_count * trade_dollars
+    total_target_value = sum(
+        (trade_dollars / entry_price) * sell_target
+        for entry_price, sell_target in open_rows
+        if entry_price and entry_price > 0
+    )
+    potential_profit = total_target_value - cost_basis
+
+    if cash_balance is None:
+        remaining_trades = 0
+        cash_str = "N/A"
+    else:
+        remaining_trades = max(
+            0, int((cash_balance - MIN_WALLET_BALANCE) / trade_dollars)
+        )
+        cash_str = f"${cash_balance:.2f}"
+
+    return (
+        f"💵 Cash Balance: {cash_str}\n"
+        f"📦 Open positions: {open_count} (cost basis: ${cost_basis:.2f})\n"
+        f"🎯 If all targets hit: +${potential_profit:.2f}\n"
+        f"🔫 Remaining capacity: {remaining_trades} more trades before ${MIN_WALLET_BALANCE:.0f} floor"
+    )
+
+
 def handle_telegram_commands() -> None:
     global telegram_offset, current_run_id, open_positions
     if not TELEGRAM_BOT_TOKEN:
@@ -1809,6 +1848,8 @@ def handle_telegram_commands() -> None:
                 )
             elif text.startswith("/dashboard"):
                 send_telegram(build_telegram_dashboard())
+            elif text.startswith("/balance"):
+                send_telegram(build_balance_report())
     except Exception as e:
         log.warning(f"Telegram command polling error: {e}")
 

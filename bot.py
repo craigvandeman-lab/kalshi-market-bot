@@ -561,19 +561,20 @@ def fetch_wallet_balance() -> float | None:
 
 
 def can_place_trade() -> bool:
-    balance = fetch_wallet_balance()
-    if balance is None:
-        log.warning("Wallet guard: could not fetch balance — skipping trade")
-        return False
+    if not PAPER_TRADING:
+        balance = fetch_wallet_balance()
+        if balance is None:
+            log.warning("Wallet guard: could not fetch balance — skipping trade")
+            return False
 
-    trade_cost = TRADE_AMOUNT_CENTS / 100
-    projected_balance = balance - cycle_spent - trade_cost
-    if projected_balance < MIN_WALLET_BALANCE:
-        log.info(
-            f"Wallet guard: balance=${balance:.2f} cycle_spent=${cycle_spent:.2f} "
-            f"trade_cost=${trade_cost:.2f} projected=${projected_balance:.2f} — skipping"
-        )
-        return False
+        trade_cost = TRADE_AMOUNT_CENTS / 100
+        projected_balance = balance - cycle_spent - trade_cost
+        if projected_balance < MIN_WALLET_BALANCE:
+            log.info(
+                f"Wallet guard: balance=${balance:.2f} cycle_spent=${cycle_spent:.2f} "
+                f"trade_cost=${trade_cost:.2f} projected=${projected_balance:.2f} — skipping"
+            )
+            return False
 
     conn = sqlite3.connect(DB_PATH)
     count = conn.execute("""

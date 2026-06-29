@@ -1,0 +1,9 @@
+services:
+  kalshi-market-bot:
+    build: .
+    container_name: kalshi-market-bot
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+    env_file:
+      - .env

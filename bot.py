@@ -99,6 +99,7 @@ telegram_offset: int = 0
 current_run_id: int = 0
 watchlist_is_valid: bool = False
 cycle_spent: float = 0.0
+last_cycle_at: datetime | None = None
 
 # vwap_cache: dict = {}
 # VWAP_CACHE_TTL_MINUTES = 15
@@ -871,6 +872,8 @@ def try_build_watchlist() -> bool:
 
 
 def run_watchlist_monitor() -> None:
+    global last_cycle_at
+
     if not watchlist_is_valid:
         return
 
@@ -946,6 +949,8 @@ def run_watchlist_monitor() -> None:
                 log.debug(
                     f"{series_ticker} | {event_date} | {bracket_label} yes_ask={ask_str} — no dip"
                 )
+
+    last_cycle_at = datetime.now(tz=UTC)
 
 
 # ENSEMBLE — not used in market-based strategy
@@ -1558,6 +1563,60 @@ def check_fills() -> None:
 # ---------------------------------------------------------------------------
 # Telegram
 # ---------------------------------------------------------------------------
+def check_health() -> None:
+    if last_cycle_at is None:
+        return
+
+    age_minutes = (datetime.now(tz=UTC) - last_cycle_at).total_seconds() / 60
+    if age_minutes > 10:
+        msg = (
+            f"⚠️ Health check: bot has not completed a monitor cycle "
+            f"in {int(age_minutes)} minutes — may be stuck or crashed"
+        )
+        log.warning(msg)
+        send_telegram(msg)
+
+
+def send_daily_summary() -> None:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+
+    recent_closed = conn.execute("""
+        SELECT entry_price, exit_price, entry_fee, exit_fee, exit_reason
+        FROM trades
+        WHERE closed_at >= datetime('now', '-24 hours') AND run_id = ?
+    """, (current_run_id,)).fetchall()
+
+    open_count = conn.execute("""
+        SELECT COUNT(*) FROM trades
+        WHERE exit_price IS NULL AND run_id = ?
+    """, (current_run_id,)).fetchone()[0]
+
+    conn.close()
+
+    target_hits = sum(1 for r in recent_closed if r["exit_reason"] == "SELL_TARGET")
+    settled_wins = sum(1 for r in recent_closed if r["exit_reason"] == "SETTLED_WIN")
+    settled_losses = sum(1 for r in recent_closed if r["exit_reason"] == "SETTLED_LOSS")
+    total_pnl = sum(
+        _trade_pnl(
+            r["entry_price"], r["exit_price"],
+            entry_fee=r["entry_fee"] or 0.0,
+            exit_fee=r["exit_fee"] or 0.0,
+        )
+        for r in recent_closed
+    )
+    pnl_str = f"+${total_pnl:.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):.2f}"
+
+    send_telegram(
+        f"📅 Daily Summary | {datetime.now(tz=UTC).strftime('%b %d')}\n"
+        f"🎯 Target hits: {target_hits}\n"
+        f"✅ Settled wins: {settled_wins}\n"
+        f"❌ Settled losses: {settled_losses}\n"
+        f"💼 Open positions: {open_count}\n"
+        f"💰 24h PnL: {pnl_str}"
+    )
+
+
 def send_telegram(msg: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -1838,9 +1897,12 @@ def main():
     schedule.every().day.at("14:05").do(_scheduled_build_watchlist)
     schedule.every(5).minutes.do(_scheduled_watchlist_monitor)
     schedule.every(5).minutes.do(check_fills)
-    schedule.every(30).seconds.do(handle_telegram_commands)
+    schedule.every(10).minutes.do(check_health)
+    schedule.every().day.at("12:00").do(send_daily_summary)
+    schedule.every(5).seconds.do(handle_telegram_commands)
     log.info(
-        "Scheduled: watchlist build daily 14:05 UTC; monitor + fills every 5 min; Telegram every 30s"
+        "Scheduled: watchlist build daily 14:05 UTC; monitor + fills every 5 min; "
+        "health check every 10 min; daily summary 12:00 UTC; Telegram every 5s"
     )
 
     try:

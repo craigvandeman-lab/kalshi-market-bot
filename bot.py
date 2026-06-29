@@ -165,6 +165,17 @@ if ENABLED_SERIES:
         f"{sorted(enabled_set)}"
     )
 
+
+def is_series_tradeable(series_ticker: str) -> bool:
+    cfg = SERIES_CONFIG.get(series_ticker)
+    if cfg is None:
+        return False
+    return cfg.get("enabled", True)
+
+
+def is_series_watchlistable(series_ticker: str) -> bool:
+    return series_ticker in SERIES_CONFIG
+
 # ---------------------------------------------------------------------------
 # Kalshi API auth
 # ---------------------------------------------------------------------------
@@ -760,7 +771,7 @@ def build_watchlist() -> dict:
     tomorrow_utc = (datetime.now(tz=UTC) + timedelta(days=1)).date()
 
     for series_ticker, cfg in SERIES_CONFIG.items():
-        if not cfg.get("enabled", True):
+        if not is_series_watchlistable(series_ticker):
             continue
 
         local_tz    = ZoneInfo(cfg["timezone"])
@@ -879,8 +890,7 @@ def run_watchlist_monitor() -> None:
 
     for event_ticker, info in watchlist.items():
         series_ticker = info.get("series_ticker", "")
-        cfg = SERIES_CONFIG.get(series_ticker, {})
-        if not cfg.get("enabled", True):
+        if not is_series_tradeable(series_ticker):
             continue
 
         occurrence_dt = info.get("occurrence_dt")

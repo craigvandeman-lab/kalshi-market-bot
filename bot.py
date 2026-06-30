@@ -753,7 +753,8 @@ def place_trade(
     send_telegram(
         f"💰 Trade placed [LIVE]\n"
         f"{series_ticker} | {event_date} | {bracket_label}\n"
-        f"Entry: ${actual_fill_price:.2f} | Target: ${sell_target:.2f} | Qty: {filled_qty}"
+        f"Entry: ${actual_fill_price:.2f} | Target: ${sell_target:.2f} | "
+        f"Qty: {filled_qty} (${filled_qty * actual_fill_price:.2f})"
     )
 
 

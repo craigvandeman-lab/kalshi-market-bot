@@ -1490,7 +1490,7 @@ def check_fills() -> None:
     if not PAPER_TRADING:
         conn = sqlite3.connect(DB_PATH)
         live_rows = conn.execute("""
-            SELECT id, series_ticker, market_ticker, bracket_label, entry_price, sell_target, sell_order_id, entry_fee
+            SELECT id, series_ticker, market_ticker, bracket_label, entry_price, sell_target, sell_order_id, entry_fee, volume
             FROM trades
             WHERE exit_price IS NULL AND paper = 0 AND run_id = ? AND sell_order_id IS NOT NULL
         """, (current_run_id,)).fetchall()
@@ -1498,9 +1498,14 @@ def check_fills() -> None:
 
         for (
             trade_id, series_ticker, market_ticker, bracket_label,
-            entry_price, sell_target, sell_order_id, entry_fee,
+            entry_price, sell_target, sell_order_id, entry_fee, volume,
         ) in live_rows:
             entry_fee = entry_fee or 0.0
+            actual_contracts = (
+                int(float(volume))
+                if volume
+                else int((TRADE_AMOUNT_CENTS / 100) / entry_price)
+            )
             event_date = parse_event_date(market_ticker)
             try:
                 data  = kalshi_get(f"/portfolio/orders/{sell_order_id}")
@@ -1515,10 +1520,14 @@ def check_fills() -> None:
                 exit_price = get_polled_exit_price(order)
                 if exit_price is None:
                     exit_price = sell_target
-                exit_fee = calc_maker_fee(exit_price, int((TRADE_AMOUNT_CENTS / 100) / entry_price))
+                exit_fee = calc_maker_fee(exit_price, actual_contracts)
                 close_trade(trade_id, exit_price, "SELL_TARGET", exit_fee=exit_fee)
                 open_positions.pop(market_ticker, None)
-                pnl = _trade_pnl(entry_price, exit_price, entry_fee=entry_fee, exit_fee=exit_fee)
+                pnl = _trade_pnl(
+                    entry_price, exit_price,
+                    entry_fee=entry_fee, exit_fee=exit_fee,
+                    contracts=actual_contracts,
+                )
                 send_telegram(
                     f"🎯 Target hit! [LIVE]\n"
                     f"{series_ticker} | {event_date} | {bracket_label}\n"
@@ -1542,7 +1551,7 @@ def check_fills() -> None:
                 if market_status in ("settled", "finalized"):
                     win        = market.get("result", "") == "yes"
                     exit_price = 1.00 if win else 0.00
-                    exit_fee = calc_maker_fee(exit_price, int((TRADE_AMOUNT_CENTS / 100) / entry_price))
+                    exit_fee = calc_maker_fee(exit_price, actual_contracts)
                     close_trade(trade_id, exit_price, "RECONCILED_SETTLEMENT", exit_fee=exit_fee)
                     open_positions.pop(market_ticker, None)
                     send_telegram(f"🔁 Sell order expired but market settled: {market_ticker}")
@@ -1690,10 +1699,11 @@ def _trade_pnl(
     exit_price: float,
     entry_fee: float = 0.0,
     exit_fee: float = 0.0,
+    contracts: float | None = None,
 ) -> float:
     if entry <= 0:
         return 0.0
-    shares = (TRADE_AMOUNT_CENTS / 100) / entry
+    shares = contracts if contracts is not None else (TRADE_AMOUNT_CENTS / 100) / entry
     return shares * (exit_price - entry) - entry_fee - exit_fee
 
 

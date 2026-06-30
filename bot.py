@@ -724,8 +724,7 @@ def place_trade(
     yes_bid       = float(market.get("yes_bid_dollars", 0) or 0)
     open_interest = float(market.get("open_interest_fp", 0) or 0)
     event_date    = parse_event_date(ticker)
-    contracts     = int((TRADE_AMOUNT_CENTS / 100) / actual_fill_price)
-    entry_fee     = calc_taker_fee(actual_fill_price, contracts)
+    entry_fee     = calc_taker_fee(actual_fill_price, filled_qty)
     slippage      = actual_fill_price - yes_ask
     if record_trade({
         "series_ticker": series_ticker,

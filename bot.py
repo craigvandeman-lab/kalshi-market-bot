@@ -220,6 +220,23 @@ def kalshi_post(endpoint: str, body: dict):
     r.raise_for_status()
     return r.json()
 
+
+def cancel_order(order_id: str) -> bool:
+    if not order_id or order_id == "UNKNOWN":
+        return False
+    try:
+        endpoint = f"/portfolio/events/orders/{order_id}"
+        path = f"/trade-api/v2{endpoint}"
+        url = f"{KALSHI_BASE_URL}{endpoint}"
+        r = requests.delete(url, headers=_get_headers("DELETE", path), timeout=10)
+        if r.ok:
+            return True
+        log.error(f"cancel_order {order_id} failed [{r.status_code}]: {r.text}")
+        return False
+    except Exception as e:
+        log.error(f"cancel_order {order_id} error: {e}")
+        return False
+
 # ---------------------------------------------------------------------------
 # Open-Meteo GFS025 ensemble
 # ---------------------------------------------------------------------------
@@ -620,6 +637,25 @@ def reset_cycle_spent() -> None:
     log.debug("Cycle spend tracker reset")
 
 
+def should_top_up(ticker: str) -> tuple[bool, float]:
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute("""
+        SELECT entry_price, volume FROM trades
+        WHERE market_ticker = ? AND exit_price IS NULL AND run_id = ?
+    """, (ticker, current_run_id)).fetchall()
+    conn.close()
+
+    existing_cost_basis = sum(
+        (entry_price or 0) * (float(volume) if volume else 0)
+        for entry_price, volume in rows
+    )
+    target_position_size = TRADE_AMOUNT_CENTS / 100
+    remaining_budget = target_position_size - existing_cost_basis
+    if remaining_budget < 0.50:
+        return (False, 0.0)
+    return (True, remaining_budget)
+
+
 def place_trade(
     series_ticker: str,
     bracket: dict,
@@ -627,6 +663,7 @@ def place_trade(
     yes_ask: float,
     vwap: float | None = None,
     is_mean_bracket: bool = False,
+    remaining_budget: float | None = None,
 ) -> None:
     global cycle_spent
 
@@ -636,7 +673,7 @@ def place_trade(
     ticker        = bracket["ticker"]
     bracket_label = bracket["bracket_label"]
 
-    if ticker in open_positions:
+    if PAPER_TRADING and ticker in open_positions:
         return
 
     if PAPER_TRADING:
@@ -683,7 +720,12 @@ def place_trade(
         return
 
     try:
-        contracts_to_buy = (TRADE_AMOUNT_CENTS / 100) / yes_ask
+        buy_dollars = (
+            remaining_budget
+            if remaining_budget is not None
+            else (TRADE_AMOUNT_CENTS / 100)
+        )
+        contracts_to_buy = buy_dollars / yes_ask
         buy_resp = kalshi_post("/portfolio/events/orders", {
             "ticker":                     ticker,
             "client_order_id":            str(uuid.uuid4()),
@@ -702,21 +744,75 @@ def place_trade(
         if actual_fill_price is None:
             log.warning(f"Could not extract fill price for {ticker}, falling back to yes_ask")
             actual_fill_price = yes_ask
-        sell_target = get_sell_target(actual_fill_price)
-        sell_resp = kalshi_post("/portfolio/events/orders", {
-            "ticker":                     ticker,
-            "client_order_id":            str(uuid.uuid4()),
-            "side":                       "ask",
-            "count":                      f"{filled_qty}.00",
-            "price":                      f"{sell_target:.4f}",
-            "time_in_force":              "good_till_canceled",
-            "self_trade_prevention_type": "taker_at_cross",
-        })
-        sell_order_id = sell_resp.get("order_id", "UNKNOWN")
-        log.info(
-            f"[LIVE] BUY {series_ticker} {bracket_label} @ {actual_fill_price:.2f} | order {order_id}"
-        )
-        log.info(f"[LIVE] SELL order placed @ {sell_target:.2f} | qty {filled_qty} | order {sell_order_id}")
+
+        conn = sqlite3.connect(DB_PATH)
+        existing_rows = conn.execute("""
+            SELECT id, entry_price, volume, sell_order_id, entry_fee
+            FROM trades
+            WHERE market_ticker = ? AND exit_price IS NULL AND run_id = ?
+            ORDER BY id DESC
+        """, (ticker, current_run_id)).fetchall()
+        conn.close()
+
+        if existing_rows:
+            existing_cost_basis = sum(
+                (row[1] or 0) * (float(row[2]) if row[2] else 0)
+                for row in existing_rows
+            )
+            existing_total_contracts = sum(
+                float(row[2]) if row[2] else 0 for row in existing_rows
+            )
+            new_total_contracts = existing_total_contracts + filled_qty
+            new_blended_entry = (
+                (existing_cost_basis + (filled_qty * actual_fill_price)) / new_total_contracts
+            )
+            new_sell_target = get_sell_target(new_blended_entry)
+
+            for row in existing_rows:
+                prior_sell_id = row[3]
+                if prior_sell_id:
+                    try:
+                        if not cancel_order(prior_sell_id):
+                            log.warning(f"Failed to cancel sell order {prior_sell_id} for {ticker}")
+                    except Exception as e:
+                        log.warning(f"Failed to cancel sell order {prior_sell_id} for {ticker}: {e}")
+
+            sell_resp = kalshi_post("/portfolio/events/orders", {
+                "ticker":                     ticker,
+                "client_order_id":            str(uuid.uuid4()),
+                "side":                       "ask",
+                "count":                      f"{new_total_contracts:.2f}",
+                "price":                      f"{new_sell_target:.4f}",
+                "time_in_force":              "good_till_canceled",
+                "self_trade_prevention_type": "taker_at_cross",
+            })
+            sell_order_id = sell_resp.get("order_id", "UNKNOWN")
+            log.info(
+                f"[LIVE] TOP-UP BUY {series_ticker} {bracket_label} @ {actual_fill_price:.2f} "
+                f"| order {order_id}"
+            )
+            log.info(
+                f"[LIVE] SELL order replaced @ {new_sell_target:.2f} | "
+                f"qty {new_total_contracts:.0f} | order {sell_order_id}"
+            )
+        else:
+            sell_target = get_sell_target(actual_fill_price)
+            sell_resp = kalshi_post("/portfolio/events/orders", {
+                "ticker":                     ticker,
+                "client_order_id":            str(uuid.uuid4()),
+                "side":                       "ask",
+                "count":                      f"{filled_qty}.00",
+                "price":                      f"{sell_target:.4f}",
+                "time_in_force":              "good_till_canceled",
+                "self_trade_prevention_type": "taker_at_cross",
+            })
+            sell_order_id = sell_resp.get("order_id", "UNKNOWN")
+            log.info(
+                f"[LIVE] BUY {series_ticker} {bracket_label} @ {actual_fill_price:.2f} | order {order_id}"
+            )
+            log.info(
+                f"[LIVE] SELL order placed @ {sell_target:.2f} | qty {filled_qty} | order {sell_order_id}"
+            )
     except Exception as e:
         log.error(f"Order failed for {ticker}: {e}")
         return
@@ -724,8 +820,40 @@ def place_trade(
     yes_bid       = float(market.get("yes_bid_dollars", 0) or 0)
     open_interest = float(market.get("open_interest_fp", 0) or 0)
     event_date    = parse_event_date(ticker)
-    entry_fee     = calc_taker_fee(actual_fill_price, filled_qty)
+    incremental_entry_fee = calc_taker_fee(actual_fill_price, filled_qty)
     slippage      = actual_fill_price - yes_ask
+    target_position_size = TRADE_AMOUNT_CENTS / 100
+
+    if existing_rows:
+        trade_id = existing_rows[0][0]
+        prior_entry_fee = existing_rows[0][4] or 0.0
+        cumulative_entry_fee = prior_entry_fee + incremental_entry_fee
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("""
+            UPDATE trades
+            SET entry_price = ?, sell_target = ?, volume = ?, sell_order_id = ?, entry_fee = ?
+            WHERE id = ?
+        """, (
+            new_blended_entry, new_sell_target, new_total_contracts,
+            sell_order_id, cumulative_entry_fee, trade_id,
+        ))
+        conn.commit()
+        conn.close()
+        cycle_spent += filled_qty * actual_fill_price
+        open_positions[ticker] = {
+            "entry":    new_blended_entry,
+            "target":   new_sell_target,
+            "order_id": order_id,
+        }
+        send_telegram(
+            f"🔼 Topped up [LIVE]\n"
+            f"{series_ticker} | {event_date} | {bracket_label}\n"
+            f"New blended entry: ${new_blended_entry:.3f} | New target: ${new_sell_target:.2f} | "
+            f"Total qty: {new_total_contracts:.0f} (${new_total_contracts * new_blended_entry:.2f} of "
+            f"${target_position_size:.2f} target)"
+        )
+        return
+
     if record_trade({
         "series_ticker": series_ticker,
         "market_ticker": ticker,
@@ -740,7 +868,7 @@ def place_trade(
         "open_interest": open_interest,
         "vwap":          vwap,
         "is_mean_bracket": 1 if is_mean_bracket else 0,
-        "entry_fee":     entry_fee,
+        "entry_fee":     incremental_entry_fee,
         "slippage":      slippage,
     }):
         cycle_spent += TRADE_AMOUNT_CENTS / 100
@@ -949,12 +1077,22 @@ def run_watchlist_monitor() -> None:
                         f"{series_ticker} | {event_date} | {bracket_label} — skipping, spread too wide"
                     )
                     continue
-                if ticker in open_positions:
-                    log.info(
-                        f"{series_ticker} | {event_date} | {bracket_label} — skipping, "
-                        f"already have position"
-                    )
-                    continue
+                if PAPER_TRADING:
+                    if ticker in open_positions:
+                        log.info(
+                            f"{series_ticker} | {event_date} | {bracket_label} — skipping, "
+                            f"already have position"
+                        )
+                        continue
+                    remaining_budget = None
+                else:
+                    can_top_up, remaining_budget = should_top_up(ticker)
+                    if not can_top_up:
+                        log.info(
+                            f"{series_ticker} | {event_date} | {bracket_label} — skipping, "
+                            f"already at target size"
+                        )
+                        continue
 
                 log.info(
                     f"DIP DETECTED [rank {rank}]: {series_ticker} | {event_date} | "
@@ -967,6 +1105,7 @@ def run_watchlist_monitor() -> None:
                     yes_ask,
                     vwap=None,
                     is_mean_bracket=(rank == 1),
+                    remaining_budget=remaining_budget,
                 )
             else:
                 ask_str = f"{yes_ask:.2f}" if yes_ask is not None else "N/A"
@@ -1570,7 +1709,7 @@ def check_fills() -> None:
                             "ticker":                     market_ticker,
                             "client_order_id":            str(uuid.uuid4()),
                             "side":                       "ask",
-                            "count":                      f"{TRADE_AMOUNT_CENTS}.00",
+                            "count":                      f"{fee_contracts}.00",
                             "price":                      f"{recovery_target:.4f}",
                             "time_in_force":              "good_till_canceled",
                             "self_trade_prevention_type": "taker_at_cross",

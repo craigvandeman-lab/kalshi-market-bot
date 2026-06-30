@@ -687,7 +687,7 @@ def place_trade(
             "action": "buy",
             "side":   "yes",
             "type":   "market",
-            "count":  TRADE_AMOUNT_CENTS,
+            "count":  str(TRADE_AMOUNT_CENTS),
         })
         order_id = resp.get("order", {}).get("order_id", "UNKNOWN")
         filled_order = poll_order_fill(order_id)
@@ -706,7 +706,7 @@ def place_trade(
             "action":            "sell",
             "side":              "yes",
             "type":              "limit",
-            "count":             filled_qty,
+            "count":             str(filled_qty),
             "yes_price_dollars": f"{sell_target:.2f}",
         })
         sell_order_id = sell_resp.get("order", {}).get("order_id", "UNKNOWN")
@@ -1555,7 +1555,7 @@ def check_fills() -> None:
                             "action":            "sell",
                             "side":              "yes",
                             "type":              "limit",
-                            "count":             TRADE_AMOUNT_CENTS,
+                            "count":             str(TRADE_AMOUNT_CENTS),
                             "yes_price_dollars": f"{recovery_target:.2f}",
                         })
                         new_order_id = sell_resp.get("order", {}).get("order_id", "UNKNOWN")

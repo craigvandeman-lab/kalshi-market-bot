@@ -1263,6 +1263,8 @@ def init_db():
         "entry_fee":       "REAL",
         "exit_fee":        "REAL",
         "slippage":        "REAL",
+        "last_known_fill_count": "REAL",
+        "realized_pnl":        "REAL",
     }
     existing = {row[1] for row in conn.execute("PRAGMA table_info(trades)")}
     for col, col_type in expected_columns.items():
@@ -1637,7 +1639,8 @@ def check_fills() -> None:
     if not PAPER_TRADING:
         conn = sqlite3.connect(DB_PATH)
         live_rows = conn.execute("""
-            SELECT id, series_ticker, market_ticker, bracket_label, entry_price, sell_target, sell_order_id, entry_fee, volume
+            SELECT id, series_ticker, market_ticker, bracket_label, entry_price, sell_target,
+                   sell_order_id, entry_fee, volume, last_known_fill_count, realized_pnl
             FROM trades
             WHERE exit_price IS NULL AND paper = 0 AND run_id = ? AND sell_order_id IS NOT NULL
         """, (current_run_id,)).fetchall()
@@ -1646,8 +1649,11 @@ def check_fills() -> None:
         for (
             trade_id, series_ticker, market_ticker, bracket_label,
             entry_price, sell_target, sell_order_id, entry_fee, volume,
+            last_known_fill_count, realized_pnl,
         ) in live_rows:
             entry_fee = entry_fee or 0.0
+            last_known_fill_count = float(last_known_fill_count or 0.0)
+            realized_pnl = float(realized_pnl or 0.0)
             fee_contracts = _fee_contract_count(volume, entry_price)
             event_date = parse_event_date(market_ticker)
             try:
@@ -1659,23 +1665,59 @@ def check_fills() -> None:
                 continue
 
             status = order.get("status", "")
+            current_fill_count = float(order.get("fill_count_fp", 0) or 0)
+            newly_filled = current_fill_count - last_known_fill_count
+
             if status == "executed":
                 exit_price = get_polled_exit_price(order)
                 if exit_price is None:
                     exit_price = sell_target
-                exit_fee = calc_maker_fee(exit_price, fee_contracts)
+                if newly_filled > 0:
+                    exit_fee = calc_maker_fee(exit_price, int(newly_filled))
+                    final_chunk_pnl = _trade_pnl(
+                        entry_price, exit_price,
+                        entry_fee=entry_fee,
+                        exit_fee=exit_fee,
+                        contracts=newly_filled,
+                    )
+                    total_pnl = realized_pnl + final_chunk_pnl
+                else:
+                    exit_fee = 0.0
+                    total_pnl = realized_pnl - entry_fee
                 close_trade(trade_id, exit_price, "SELL_TARGET", exit_fee=exit_fee)
                 open_positions.pop(market_ticker, None)
-                pnl = _trade_pnl(
-                    entry_price, exit_price,
-                    entry_fee=entry_fee, exit_fee=exit_fee,
-                    contracts=_contracts_from_volume(volume),
-                )
                 send_telegram(
                     f"🎯 Target hit! [LIVE]\n"
                     f"{series_ticker} | {event_date} | {bracket_label}\n"
-                    f"${entry_price:.2f} → ${exit_price:.2f} | PnL: +${pnl:.2f}"
+                    f"${entry_price:.2f} → ${exit_price:.2f} | PnL: +${total_pnl:.2f}"
                 )
+            elif newly_filled > 0:
+                partial_pnl = _trade_pnl(
+                    entry_price, sell_target,
+                    entry_fee=0,
+                    exit_fee=calc_maker_fee(sell_target, int(newly_filled)),
+                    contracts=newly_filled,
+                )
+                remaining_count = float(order.get("remaining_count_fp", 0) or 0)
+                total_order_contracts = current_fill_count + remaining_count
+                send_telegram(
+                    f"🎯 Partial fill [LIVE]\n"
+                    f"{series_ticker} | {event_date} | {bracket_label}\n"
+                    f"${entry_price:.2f} → ${sell_target:.2f} | Sold {newly_filled:.0f} of "
+                    f"{total_order_contracts:.0f} | "
+                    f"Partial PnL: +${partial_pnl:.2f}"
+                )
+                new_volume = float(volume or 0) - newly_filled
+                conn = sqlite3.connect(DB_PATH)
+                conn.execute("""
+                    UPDATE trades
+                    SET last_known_fill_count = ?, volume = ?, realized_pnl = ?
+                    WHERE id = ?
+                """, (
+                    current_fill_count, new_volume, realized_pnl + partial_pnl, trade_id,
+                ))
+                conn.commit()
+                conn.close()
             elif status in ("cancelled", "expired", "canceled"):
                 try:
                     mdata  = kalshi_get(f"/markets/{market_ticker}")
@@ -1718,7 +1760,7 @@ def check_fills() -> None:
                         new_order_id = sell_resp.get("order_id", "UNKNOWN")
                         conn = sqlite3.connect(DB_PATH)
                         conn.execute(
-                            "UPDATE trades SET sell_order_id = ? WHERE id = ?",
+                            "UPDATE trades SET sell_order_id = ?, last_known_fill_count = 0 WHERE id = ?",
                             (new_order_id, trade_id),
                         )
                         conn.commit()

@@ -703,7 +703,7 @@ def place_trade(
         log.info(
             f"[LIVE] BUY {series_ticker} {bracket_label} @ {actual_fill_price:.2f} | order {order_id}"
         )
-        log.info(f"[LIVE] SELL order placed @ {sell_target:.2f} | order {sell_order_id}")
+        log.info(f"[LIVE] SELL order placed @ {sell_target:.2f} | qty {filled_qty} | order {sell_order_id}")
     except Exception as e:
         log.error(f"Order failed for {ticker}: {e}")
         return

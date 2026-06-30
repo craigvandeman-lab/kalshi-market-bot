@@ -688,8 +688,8 @@ def place_trade(
             "side":   "yes",
             "type":   "market",
             "count":  str(TRADE_AMOUNT_CENTS),
-            "self_trade_prevention_type": "CANCEL_RESTING",
-            "time_in_force":              "IMMEDIATE_OR_CANCEL",
+            "self_trade_prevention_type": "taker_at_cross",
+            "time_in_force":              "immediate_or_cancel",
         })
         order_id = resp.get("order", {}).get("order_id", "UNKNOWN")
         filled_order = poll_order_fill(order_id)
@@ -710,8 +710,8 @@ def place_trade(
             "type":              "limit",
             "count":             str(filled_qty),
             "yes_price_dollars": f"{sell_target:.2f}",
-            "self_trade_prevention_type": "CANCEL_RESTING",
-            "time_in_force":              "GOOD_TILL_CANCELLED",
+            "self_trade_prevention_type": "taker_at_cross",
+            "time_in_force":              "good_till_canceled",
         })
         sell_order_id = sell_resp.get("order", {}).get("order_id", "UNKNOWN")
         log.info(
@@ -1561,8 +1561,8 @@ def check_fills() -> None:
                             "type":              "limit",
                             "count":             str(TRADE_AMOUNT_CENTS),
                             "yes_price_dollars": f"{recovery_target:.2f}",
-                            "self_trade_prevention_type": "CANCEL_RESTING",
-                            "time_in_force":              "GOOD_TILL_CANCELLED",
+                            "self_trade_prevention_type": "taker_at_cross",
+                            "time_in_force":              "good_till_canceled",
                         })
                         new_order_id = sell_resp.get("order", {}).get("order_id", "UNKNOWN")
                         conn = sqlite3.connect(DB_PATH)

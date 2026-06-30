@@ -497,11 +497,11 @@ def poll_order_fill(order_id: str, timeout_seconds: int = 30, interval_seconds: 
     while time.time() < deadline:
         try:
             data = kalshi_get(f"/portfolio/orders/{order_id}")
-            order = data.get("order", {})
+            order = data.get("order") or data
             status = order.get("status", "")
             if status == "filled":
                 return order
-            if status in ("cancelled", "expired"):
+            if status in ("cancelled", "expired", "canceled"):
                 return None
         except Exception as e:
             log.error(f"poll_order_fill error for {order_id}: {e}")
@@ -511,7 +511,29 @@ def poll_order_fill(order_id: str, timeout_seconds: int = 30, interval_seconds: 
 
 
 def get_actual_fill_price(order: dict) -> float | None:
-    for key in ("yes_price_dollars", "avg_price_dollars"):
+    if get_filled_quantity(order) == 0:
+        return None
+    raw = order.get("average_fill_price")
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def get_filled_quantity(order: dict) -> int:
+    raw = order.get("fill_count")
+    if raw is None:
+        return 0
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        return 0
+
+
+def get_polled_exit_price(order: dict) -> float | None:
+    for key in ("yes_price_dollars", "average_fill_price"):
         raw = order.get(key)
         if raw is None:
             continue
@@ -519,29 +541,7 @@ def get_actual_fill_price(order: dict) -> float | None:
             return float(raw)
         except (TypeError, ValueError):
             continue
-    for key in ("avg_price", "yes_price"):
-        raw = order.get(key)
-        if raw is None:
-            continue
-        try:
-            val = float(raw)
-        except (TypeError, ValueError):
-            continue
-        if val > 1.0:
-            val = val / 100.0
-        return val
     return None
-
-
-def get_filled_quantity(order: dict) -> int:
-    for key in ("fill_count_fp", "filled_count", "count"):
-        raw = order.get(key)
-        if raw is not None:
-            try:
-                return int(float(raw))
-            except (TypeError, ValueError):
-                pass
-    return TRADE_AMOUNT_CENTS
 
 
 def get_sell_target(entry_price: float) -> float:
@@ -683,36 +683,35 @@ def place_trade(
         return
 
     try:
-        resp = kalshi_post("/portfolio/orders", {
-            "ticker":          ticker,
-            "client_order_id": str(uuid.uuid4()),
-            "side":            "yes",
-            "action":          "buy",
-            "count":           TRADE_AMOUNT_CENTS,
-            "time_in_force":   "immediate_or_cancel",
+        buy_resp = kalshi_post("/portfolio/events/orders", {
+            "ticker":                     ticker,
+            "client_order_id":            str(uuid.uuid4()),
+            "side":                       "bid",
+            "count":                      f"{TRADE_AMOUNT_CENTS}.00",
+            "price":                      f"{yes_ask:.4f}",
+            "time_in_force":              "immediate_or_cancel",
+            "self_trade_prevention_type": "taker_at_cross",
         })
-        order_id = resp.get("order", {}).get("order_id", "UNKNOWN")
-        filled_order = poll_order_fill(order_id)
-        if filled_order is None:
-            log.warning(f"Market buy not confirmed for {ticker}, aborting")
-            send_telegram(f"⚠️ Buy order unconfirmed for {ticker} — no sell placed")
+        order_id = buy_resp.get("order_id", "UNKNOWN")
+        filled_qty = get_filled_quantity(buy_resp)
+        if filled_qty == 0:
+            log.info(f"IOC buy not filled for {ticker} at {yes_ask:.2f} — price moved, skipping")
             return
-        actual_fill_price = get_actual_fill_price(filled_order)
+        actual_fill_price = get_actual_fill_price(buy_resp)
         if actual_fill_price is None:
             log.warning(f"Could not extract fill price for {ticker}, falling back to yes_ask")
             actual_fill_price = yes_ask
-        filled_qty = get_filled_quantity(filled_order)
         sell_target = get_sell_target(actual_fill_price)
-        sell_resp = kalshi_post("/portfolio/orders", {
-            "ticker":            ticker,
-            "client_order_id":   str(uuid.uuid4()),
-            "side":              "yes",
-            "action":            "sell",
-            "count":             filled_qty,
-            "yes_price_dollars": f"{sell_target:.2f}",
-            "time_in_force":     "good_till_canceled",
+        sell_resp = kalshi_post("/portfolio/events/orders", {
+            "ticker":                     ticker,
+            "client_order_id":            str(uuid.uuid4()),
+            "side":                       "ask",
+            "count":                      f"{filled_qty}.00",
+            "price":                      f"{sell_target:.4f}",
+            "time_in_force":              "good_till_canceled",
+            "self_trade_prevention_type": "taker_at_cross",
         })
-        sell_order_id = sell_resp.get("order", {}).get("order_id", "UNKNOWN")
+        sell_order_id = sell_resp.get("order_id", "UNKNOWN")
         log.info(
             f"[LIVE] BUY {series_ticker} {bracket_label} @ {actual_fill_price:.2f} | order {order_id}"
         )
@@ -1503,7 +1502,7 @@ def check_fills() -> None:
             event_date = parse_event_date(market_ticker)
             try:
                 data  = kalshi_get(f"/portfolio/orders/{sell_order_id}")
-                order = data.get("order", {})
+                order = data.get("order") or data
             except Exception as e:
                 log.warning(f"check_fills: sell order fetch failed for {market_ticker}: {e}")
                 time.sleep(0.25)
@@ -1511,7 +1510,7 @@ def check_fills() -> None:
 
             status = order.get("status", "")
             if status == "filled":
-                exit_price = get_actual_fill_price(order)
+                exit_price = get_polled_exit_price(order)
                 if exit_price is None:
                     exit_price = sell_target
                 exit_fee = calc_maker_fee(exit_price, int((TRADE_AMOUNT_CENTS / 100) / entry_price))
@@ -1523,7 +1522,7 @@ def check_fills() -> None:
                     f"{series_ticker} | {event_date} | {bracket_label}\n"
                     f"${entry_price:.2f} → ${exit_price:.2f} | PnL: +${pnl:.2f}"
                 )
-            elif status in ("cancelled", "expired"):
+            elif status in ("cancelled", "expired", "canceled"):
                 try:
                     mdata  = kalshi_get(f"/markets/{market_ticker}")
                     market = mdata.get("market", {})
@@ -1553,16 +1552,16 @@ def check_fills() -> None:
                         f"target={recovery_target:.2f}"
                     )
                     try:
-                        sell_resp = kalshi_post("/portfolio/orders", {
-                            "ticker":            market_ticker,
-                            "client_order_id":   str(uuid.uuid4()),
-                            "side":              "yes",
-                            "action":            "sell",
-                            "count":             TRADE_AMOUNT_CENTS,
-                            "yes_price_dollars": f"{recovery_target:.2f}",
-                            "time_in_force":     "good_till_canceled",
+                        sell_resp = kalshi_post("/portfolio/events/orders", {
+                            "ticker":                     market_ticker,
+                            "client_order_id":            str(uuid.uuid4()),
+                            "side":                       "ask",
+                            "count":                      f"{TRADE_AMOUNT_CENTS}.00",
+                            "price":                      f"{recovery_target:.4f}",
+                            "time_in_force":              "good_till_canceled",
+                            "self_trade_prevention_type": "taker_at_cross",
                         })
-                        new_order_id = sell_resp.get("order", {}).get("order_id", "UNKNOWN")
+                        new_order_id = sell_resp.get("order_id", "UNKNOWN")
                         conn = sqlite3.connect(DB_PATH)
                         conn.execute(
                             "UPDATE trades SET sell_order_id = ? WHERE id = ?",

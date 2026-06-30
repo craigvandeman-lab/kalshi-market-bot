@@ -499,7 +499,7 @@ def poll_order_fill(order_id: str, timeout_seconds: int = 30, interval_seconds: 
             data = kalshi_get(f"/portfolio/orders/{order_id}")
             order = data.get("order") or data
             status = order.get("status", "")
-            if status == "filled":
+            if status == "executed":
                 return order
             if status in ("cancelled", "expired", "canceled"):
                 return None
@@ -1510,7 +1510,7 @@ def check_fills() -> None:
                 continue
 
             status = order.get("status", "")
-            if status == "filled":
+            if status == "executed":
                 exit_price = get_polled_exit_price(order)
                 if exit_price is None:
                     exit_price = sell_target

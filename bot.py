@@ -683,11 +683,12 @@ def place_trade(
         return
 
     try:
+        contracts_to_buy = (TRADE_AMOUNT_CENTS / 100) / yes_ask
         buy_resp = kalshi_post("/portfolio/events/orders", {
             "ticker":                     ticker,
             "client_order_id":            str(uuid.uuid4()),
             "side":                       "bid",
-            "count":                      f"{TRADE_AMOUNT_CENTS}.00",
+            "count":                      f"{contracts_to_buy:.2f}",
             "price":                      f"{yes_ask:.4f}",
             "time_in_force":              "immediate_or_cancel",
             "self_trade_prevention_type": "taker_at_cross",

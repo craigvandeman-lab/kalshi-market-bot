@@ -1842,19 +1842,21 @@ def build_balance_report() -> str:
 
     conn = sqlite3.connect(DB_PATH)
     open_rows = conn.execute("""
-        SELECT entry_price, sell_target
+        SELECT entry_price, sell_target, volume
         FROM trades
         WHERE exit_price IS NULL AND run_id = ?
     """, (current_run_id,)).fetchall()
     conn.close()
 
     open_count = len(open_rows)
-    cost_basis = open_count * trade_dollars
-    total_target_value = sum(
-        (trade_dollars / entry_price) * sell_target
-        for entry_price, sell_target in open_rows
-        if entry_price and entry_price > 0
-    )
+    cost_basis = 0.0
+    total_target_value = 0.0
+    for entry_price, sell_target, volume in open_rows:
+        if not entry_price or entry_price <= 0:
+            continue
+        actual_contracts = float(volume) if volume else (trade_dollars / entry_price)
+        cost_basis += actual_contracts * entry_price
+        total_target_value += actual_contracts * sell_target
     potential_profit = total_target_value - cost_basis
 
     if cash_balance is None:

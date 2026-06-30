@@ -1427,13 +1427,13 @@ def reconcile_positions() -> None:
 def check_fills() -> None:
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute("""
-        SELECT id, series_ticker, market_ticker, bracket_label, entry_price, sell_target, entry_fee
+        SELECT id, series_ticker, market_ticker, bracket_label, entry_price, sell_target, entry_fee, volume
         FROM trades
         WHERE exit_price IS NULL AND paper = 1 AND run_id = ?
     """, (current_run_id,)).fetchall()
     conn.close()
 
-    for trade_id, series_ticker, market_ticker, bracket_label, entry_price, sell_target, entry_fee in rows:
+    for trade_id, series_ticker, market_ticker, bracket_label, entry_price, sell_target, entry_fee, volume in rows:
         entry_fee = entry_fee or 0.0
         try:
             data   = kalshi_get(f"/markets/{market_ticker}")
@@ -1450,10 +1450,14 @@ def check_fills() -> None:
             win        = market.get("result", "") == "yes"
             exit_price = 1.00 if win else 0.00
             exit_reason = "SETTLED_WIN" if win else "SETTLED_LOSS"
-            exit_fee = calc_maker_fee(exit_price, int((TRADE_AMOUNT_CENTS / 100) / entry_price))
+            exit_fee = calc_maker_fee(exit_price, _fee_contract_count(volume, entry_price))
             close_trade(trade_id, exit_price, exit_reason, exit_fee=exit_fee)
             open_positions.pop(market_ticker, None)
-            pnl = _trade_pnl(entry_price, exit_price, entry_fee=entry_fee, exit_fee=exit_fee)
+            pnl = _trade_pnl(
+                entry_price, exit_price,
+                entry_fee=entry_fee, exit_fee=exit_fee,
+                contracts=_contracts_from_volume(volume),
+            )
             if win:
                 send_telegram(
                     f"✅ Settled WIN [{mode_label}]\n"
@@ -1475,10 +1479,14 @@ def check_fills() -> None:
             last_price = 0.0
 
         if last_price > 0 and last_price >= sell_target:
-            exit_fee = calc_maker_fee(sell_target, int((TRADE_AMOUNT_CENTS / 100) / entry_price))
+            exit_fee = calc_maker_fee(sell_target, _fee_contract_count(volume, entry_price))
             close_trade(trade_id, sell_target, "SELL_TARGET", exit_fee=exit_fee)
             open_positions.pop(market_ticker, None)
-            pnl = _trade_pnl(entry_price, sell_target, entry_fee=entry_fee, exit_fee=exit_fee)
+            pnl = _trade_pnl(
+                entry_price, sell_target,
+                entry_fee=entry_fee, exit_fee=exit_fee,
+                contracts=_contracts_from_volume(volume),
+            )
             send_telegram(
                 f"🎯 Target hit! [{mode_label}]\n"
                 f"{series_ticker} | {event_date} | {bracket_label}\n"
@@ -1501,11 +1509,7 @@ def check_fills() -> None:
             entry_price, sell_target, sell_order_id, entry_fee, volume,
         ) in live_rows:
             entry_fee = entry_fee or 0.0
-            actual_contracts = (
-                int(float(volume))
-                if volume
-                else int((TRADE_AMOUNT_CENTS / 100) / entry_price)
-            )
+            fee_contracts = _fee_contract_count(volume, entry_price)
             event_date = parse_event_date(market_ticker)
             try:
                 data  = kalshi_get(f"/portfolio/orders/{sell_order_id}")
@@ -1520,13 +1524,13 @@ def check_fills() -> None:
                 exit_price = get_polled_exit_price(order)
                 if exit_price is None:
                     exit_price = sell_target
-                exit_fee = calc_maker_fee(exit_price, actual_contracts)
+                exit_fee = calc_maker_fee(exit_price, fee_contracts)
                 close_trade(trade_id, exit_price, "SELL_TARGET", exit_fee=exit_fee)
                 open_positions.pop(market_ticker, None)
                 pnl = _trade_pnl(
                     entry_price, exit_price,
                     entry_fee=entry_fee, exit_fee=exit_fee,
-                    contracts=actual_contracts,
+                    contracts=_contracts_from_volume(volume),
                 )
                 send_telegram(
                     f"🎯 Target hit! [LIVE]\n"
@@ -1551,7 +1555,7 @@ def check_fills() -> None:
                 if market_status in ("settled", "finalized"):
                     win        = market.get("result", "") == "yes"
                     exit_price = 1.00 if win else 0.00
-                    exit_fee = calc_maker_fee(exit_price, actual_contracts)
+                    exit_fee = calc_maker_fee(exit_price, fee_contracts)
                     close_trade(trade_id, exit_price, "RECONCILED_SETTLEMENT", exit_fee=exit_fee)
                     open_positions.pop(market_ticker, None)
                     send_telegram(f"🔁 Sell order expired but market settled: {market_ticker}")
@@ -1617,7 +1621,7 @@ def send_daily_summary() -> None:
     conn.row_factory = sqlite3.Row
 
     recent_closed = conn.execute("""
-        SELECT entry_price, exit_price, entry_fee, exit_fee, exit_reason
+        SELECT entry_price, exit_price, entry_fee, exit_fee, exit_reason, volume
         FROM trades
         WHERE closed_at >= datetime('now', '-24 hours') AND run_id = ?
     """, (current_run_id,)).fetchall()
@@ -1637,6 +1641,7 @@ def send_daily_summary() -> None:
             r["entry_price"], r["exit_price"],
             entry_fee=r["entry_fee"] or 0.0,
             exit_fee=r["exit_fee"] or 0.0,
+            contracts=_contracts_from_volume(r["volume"]),
         )
         for r in recent_closed
     )
@@ -1694,6 +1699,25 @@ def _format_position_age(created_at: str | None) -> str:
     return f"{minutes}m"
 
 
+def _contracts_from_volume(volume) -> float | None:
+    if volume is None or volume == 0:
+        return None
+    try:
+        count = int(float(volume))
+    except (TypeError, ValueError):
+        return None
+    return count if count > 0 else None
+
+
+def _fee_contract_count(volume, entry_price: float) -> int:
+    contracts = _contracts_from_volume(volume)
+    if contracts is not None:
+        return int(contracts)
+    if entry_price <= 0:
+        return 0
+    return int((TRADE_AMOUNT_CENTS / 100) / entry_price)
+
+
 def _trade_pnl(
     entry: float,
     exit_price: float,
@@ -1710,14 +1734,17 @@ def _trade_pnl(
 def _avg_pnl(rows: list[tuple]) -> float:
     if not rows:
         return 0.0
-    return sum(
-        _trade_pnl(
+    total = 0.0
+    for r in rows:
+        volume = r[4] if len(r) > 4 else None
+        contracts = int(float(volume)) if volume else None
+        total += _trade_pnl(
             r[0], r[1],
-            entry_fee=r[2] if len(r) > 2 else 0.0,
-            exit_fee=r[3] if len(r) > 3 else 0.0,
+            entry_fee=(r[2] or 0.0) if len(r) > 2 else 0.0,
+            exit_fee=(r[3] or 0.0) if len(r) > 3 else 0.0,
+            contracts=contracts,
         )
-        for r in rows
-    ) / len(rows)
+    return total / len(rows)
 
 
 def build_telegram_dashboard() -> str:
@@ -1732,25 +1759,25 @@ def build_telegram_dashboard() -> str:
     """, (current_run_id,)).fetchall()
 
     sell_target_wins = conn.execute("""
-        SELECT entry_price, exit_price, entry_fee, exit_fee
+        SELECT entry_price, exit_price, entry_fee, exit_fee, volume
         FROM trades
         WHERE exit_reason = 'SELL_TARGET' AND exit_price IS NOT NULL AND run_id = ?
     """, (current_run_id,)).fetchall()
 
     settled_wins = conn.execute("""
-        SELECT entry_price, exit_price, entry_fee, exit_fee
+        SELECT entry_price, exit_price, entry_fee, exit_fee, volume
         FROM trades
         WHERE exit_reason = 'SETTLED_WIN' AND exit_price IS NOT NULL AND run_id = ?
     """, (current_run_id,)).fetchall()
 
     settled_losses = conn.execute("""
-        SELECT entry_price, exit_price, entry_fee, exit_fee
+        SELECT entry_price, exit_price, entry_fee, exit_fee, volume
         FROM trades
         WHERE exit_reason = 'SETTLED_LOSS' AND exit_price IS NOT NULL AND run_id = ?
     """, (current_run_id,)).fetchall()
 
     all_closed = conn.execute("""
-        SELECT entry_price, exit_price, entry_fee, exit_fee
+        SELECT entry_price, exit_price, entry_fee, exit_fee, volume
         FROM trades
         WHERE exit_price IS NOT NULL AND run_id = ?
     """, (current_run_id,)).fetchall()
@@ -1763,19 +1790,20 @@ def build_telegram_dashboard() -> str:
             r["entry_price"], r["exit_price"],
             entry_fee=r["entry_fee"] or 0.0,
             exit_fee=r["exit_fee"] or 0.0,
+            contracts=int(float(r["volume"])) if r["volume"] else None,
         )
         for r in all_closed
     )
     win_rows = [
-        (r["entry_price"], r["exit_price"], r["entry_fee"] or 0.0, r["exit_fee"] or 0.0)
+        (r["entry_price"], r["exit_price"], r["entry_fee"], r["exit_fee"], r["volume"])
         for r in sell_target_wins
     ]
     settled_win_rows = [
-        (r["entry_price"], r["exit_price"], r["entry_fee"] or 0.0, r["exit_fee"] or 0.0)
+        (r["entry_price"], r["exit_price"], r["entry_fee"], r["exit_fee"], r["volume"])
         for r in settled_wins
     ]
     loss_rows = [
-        (r["entry_price"], r["exit_price"], r["entry_fee"] or 0.0, r["exit_fee"] or 0.0)
+        (r["entry_price"], r["exit_price"], r["entry_fee"], r["exit_fee"], r["volume"])
         for r in settled_losses
     ]
     total_pnl_str = f"+${total_pnl:.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):.2f}"

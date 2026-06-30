@@ -508,7 +508,15 @@ def poll_order_fill(order_id: str, timeout_seconds: int = 30, interval_seconds: 
 
 
 def get_actual_fill_price(order: dict) -> float | None:
-    for key in ("avg_price_dollars", "yes_price_dollars", "avg_price", "yes_price"):
+    for key in ("yes_price_dollars", "avg_price_dollars"):
+        raw = order.get(key)
+        if raw is None:
+            continue
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            continue
+    for key in ("avg_price", "yes_price"):
         raw = order.get(key)
         if raw is None:
             continue
@@ -672,7 +680,7 @@ def place_trade(
         return
 
     try:
-        resp = kalshi_post("/portfolio/orders", {
+        resp = kalshi_post("/portfolio/events/orders", {
             "ticker": ticker,
             "action": "buy",
             "side":   "yes",
@@ -691,13 +699,13 @@ def place_trade(
             actual_fill_price = yes_ask
         filled_qty = get_filled_quantity(filled_order)
         sell_target = get_sell_target(actual_fill_price)
-        sell_resp = kalshi_post("/portfolio/orders", {
-            "ticker":    ticker,
-            "action":    "sell",
-            "side":      "yes",
-            "type":      "limit",
-            "count":     filled_qty,
-            "yes_price": int(round(sell_target * 100)),
+        sell_resp = kalshi_post("/portfolio/events/orders", {
+            "ticker":            ticker,
+            "action":            "sell",
+            "side":              "yes",
+            "type":              "limit",
+            "count":             filled_qty,
+            "yes_price_dollars": f"{sell_target:.2f}",
         })
         sell_order_id = sell_resp.get("order", {}).get("order_id", "UNKNOWN")
         log.info(
@@ -1540,13 +1548,13 @@ def check_fills() -> None:
                         f"target={recovery_target:.2f}"
                     )
                     try:
-                        sell_resp = kalshi_post("/portfolio/orders", {
-                            "ticker":    market_ticker,
-                            "action":    "sell",
-                            "side":      "yes",
-                            "type":      "limit",
-                            "count":     TRADE_AMOUNT_CENTS,
-                            "yes_price": int(round(recovery_target * 100)),
+                        sell_resp = kalshi_post("/portfolio/events/orders", {
+                            "ticker":            market_ticker,
+                            "action":            "sell",
+                            "side":              "yes",
+                            "type":              "limit",
+                            "count":             TRADE_AMOUNT_CENTS,
+                            "yes_price_dollars": f"{recovery_target:.2f}",
                         })
                         new_order_id = sell_resp.get("order", {}).get("order_id", "UNKNOWN")
                         conn = sqlite3.connect(DB_PATH)

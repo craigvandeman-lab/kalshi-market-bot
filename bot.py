@@ -7,6 +7,7 @@ Market-based bracket selection (ensemble logic disabled).
 import os
 import sys
 import time
+import uuid
 import json
 import base64
 import logging
@@ -682,14 +683,13 @@ def place_trade(
         return
 
     try:
-        resp = kalshi_post("/portfolio/events/orders", {
-            "ticker": ticker,
-            "action": "buy",
-            "side":   "yes",
-            "type":   "market",
-            "count":  str(TRADE_AMOUNT_CENTS),
-            "self_trade_prevention_type": "taker_at_cross",
-            "time_in_force":              "immediate_or_cancel",
+        resp = kalshi_post("/portfolio/orders", {
+            "ticker":          ticker,
+            "client_order_id": str(uuid.uuid4()),
+            "side":            "yes",
+            "action":          "buy",
+            "count":           TRADE_AMOUNT_CENTS,
+            "time_in_force":   "immediate_or_cancel",
         })
         order_id = resp.get("order", {}).get("order_id", "UNKNOWN")
         filled_order = poll_order_fill(order_id)
@@ -703,15 +703,14 @@ def place_trade(
             actual_fill_price = yes_ask
         filled_qty = get_filled_quantity(filled_order)
         sell_target = get_sell_target(actual_fill_price)
-        sell_resp = kalshi_post("/portfolio/events/orders", {
+        sell_resp = kalshi_post("/portfolio/orders", {
             "ticker":            ticker,
-            "action":            "sell",
+            "client_order_id":   str(uuid.uuid4()),
             "side":              "yes",
-            "type":              "limit",
-            "count":             str(filled_qty),
+            "action":            "sell",
+            "count":             filled_qty,
             "yes_price_dollars": f"{sell_target:.2f}",
-            "self_trade_prevention_type": "taker_at_cross",
-            "time_in_force":              "good_till_canceled",
+            "time_in_force":     "good_till_canceled",
         })
         sell_order_id = sell_resp.get("order", {}).get("order_id", "UNKNOWN")
         log.info(
@@ -1554,15 +1553,14 @@ def check_fills() -> None:
                         f"target={recovery_target:.2f}"
                     )
                     try:
-                        sell_resp = kalshi_post("/portfolio/events/orders", {
+                        sell_resp = kalshi_post("/portfolio/orders", {
                             "ticker":            market_ticker,
-                            "action":            "sell",
+                            "client_order_id":   str(uuid.uuid4()),
                             "side":              "yes",
-                            "type":              "limit",
-                            "count":             str(TRADE_AMOUNT_CENTS),
+                            "action":            "sell",
+                            "count":             TRADE_AMOUNT_CENTS,
                             "yes_price_dollars": f"{recovery_target:.2f}",
-                            "self_trade_prevention_type": "taker_at_cross",
-                            "time_in_force":              "good_till_canceled",
+                            "time_in_force":     "good_till_canceled",
                         })
                         new_order_id = sell_resp.get("order", {}).get("order_id", "UNKNOWN")
                         conn = sqlite3.connect(DB_PATH)

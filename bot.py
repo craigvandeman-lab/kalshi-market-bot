@@ -1672,18 +1672,15 @@ def check_fills() -> None:
                 exit_price = get_polled_exit_price(order)
                 if exit_price is None:
                     exit_price = sell_target
-                if newly_filled > 0:
-                    exit_fee = calc_maker_fee(exit_price, int(newly_filled))
-                    final_chunk_pnl = _trade_pnl(
-                        entry_price, exit_price,
-                        entry_fee=entry_fee,
-                        exit_fee=exit_fee,
-                        contracts=newly_filled,
-                    )
-                    total_pnl = realized_pnl + final_chunk_pnl
-                else:
-                    exit_fee = 0.0
-                    total_pnl = realized_pnl - entry_fee
+                total_contracts_sold = last_known_fill_count + newly_filled
+                exit_fee = calc_maker_fee(exit_price, int(total_contracts_sold))
+                final_pnl = _trade_pnl(
+                    entry_price, exit_price,
+                    entry_fee=entry_fee,
+                    exit_fee=exit_fee,
+                    contracts=total_contracts_sold,
+                )
+                total_pnl = realized_pnl + final_pnl
                 close_trade(trade_id, exit_price, "SELL_TARGET", exit_fee=exit_fee)
                 open_positions.pop(market_ticker, None)
                 send_telegram(

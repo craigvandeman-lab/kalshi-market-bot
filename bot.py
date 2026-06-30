@@ -72,6 +72,7 @@ MAX_SPREAD       = 0.06
 MIN_WALLET_BALANCE = float(os.getenv("MIN_WALLET_BALANCE", "50.00"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "999"))
 ENABLED_SERIES     = os.getenv("ENABLED_SERIES", "")
+SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "2"))
 
 EASTERN = ZoneInfo("America/New_York")
 UTC     = ZoneInfo("UTC")
@@ -2139,13 +2140,13 @@ def main():
     #     schedule.every().day.at(hour).do(_scheduled_ensemble_update)
     # schedule.every().day.at("14:05").do(_scheduled_refresh_markets)
     schedule.every().day.at("14:05").do(_scheduled_build_watchlist)
-    schedule.every(5).minutes.do(_scheduled_watchlist_monitor)
-    schedule.every(5).minutes.do(check_fills)
+    schedule.every(SCAN_INTERVAL_MINUTES).minutes.do(_scheduled_watchlist_monitor)
+    schedule.every(SCAN_INTERVAL_MINUTES).minutes.do(check_fills)
     schedule.every(10).minutes.do(check_health)
     schedule.every().day.at("12:00").do(send_daily_summary)
     schedule.every(5).seconds.do(handle_telegram_commands)
     log.info(
-        "Scheduled: watchlist build daily 14:05 UTC; monitor + fills every 5 min; "
+        f"Scheduled: watchlist build daily 14:05 UTC; monitor + fills every {SCAN_INTERVAL_MINUTES} min; "
         "health check every 10 min; daily summary 12:00 UTC; Telegram every 5s"
     )
 

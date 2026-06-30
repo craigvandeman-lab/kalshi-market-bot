@@ -1357,7 +1357,7 @@ def reconcile_positions() -> None:
     kalshi_open: set[str] = set()
     for pos in positions:
         try:
-            count = float(pos.get("count_long_fp", 0) or 0)
+            count = float(pos.get("position_fp", 0) or 0)
         except (TypeError, ValueError):
             count = 0.0
         if count <= 0:

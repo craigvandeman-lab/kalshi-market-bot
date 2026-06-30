@@ -214,6 +214,8 @@ def kalshi_post(endpoint: str, body: dict):
     path = f"/trade-api/v2{endpoint}"
     url  = f"{KALSHI_BASE_URL}{endpoint}"
     r = requests.post(url, headers=_get_headers("POST", path), json=body, timeout=10)
+    if not r.ok:
+        log.error(f"kalshi_post {endpoint} failed [{r.status_code}]: {r.text}")
     r.raise_for_status()
     return r.json()
 

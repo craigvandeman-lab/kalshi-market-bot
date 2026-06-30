@@ -1809,6 +1809,12 @@ def send_daily_summary() -> None:
         WHERE exit_price IS NULL AND run_id = ?
     """, (current_run_id,)).fetchone()[0]
 
+    open_partial = conn.execute("""
+        SELECT realized_pnl
+        FROM trades
+        WHERE exit_price IS NULL AND run_id = ? AND realized_pnl IS NOT NULL
+    """, (current_run_id,)).fetchall()
+
     conn.close()
 
     target_hits = sum(1 for r in recent_closed if r["exit_reason"] == "SELL_TARGET")
@@ -1822,7 +1828,7 @@ def send_daily_summary() -> None:
             contracts=_contracts_from_volume(r["volume"]),
         )
         for r in recent_closed
-    )
+    ) + sum(r["realized_pnl"] or 0.0 for r in open_partial)
     pnl_str = f"+${total_pnl:.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):.2f}"
 
     send_telegram(
@@ -1960,6 +1966,12 @@ def build_telegram_dashboard() -> str:
         WHERE exit_price IS NOT NULL AND run_id = ?
     """, (current_run_id,)).fetchall()
 
+    open_partial = conn.execute("""
+        SELECT realized_pnl
+        FROM trades
+        WHERE exit_price IS NULL AND run_id = ? AND realized_pnl IS NOT NULL
+    """, (current_run_id,)).fetchall()
+
     conn.close()
 
     now = datetime.now(tz=EASTERN)
@@ -1971,7 +1983,7 @@ def build_telegram_dashboard() -> str:
             contracts=int(float(r["volume"])) if r["volume"] else None,
         )
         for r in all_closed
-    )
+    ) + sum(r["realized_pnl"] or 0.0 for r in open_partial)
     win_rows = [
         (r["entry_price"], r["exit_price"], r["entry_fee"], r["exit_fee"], r["volume"])
         for r in sell_target_wins

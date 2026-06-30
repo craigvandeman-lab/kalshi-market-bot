@@ -1329,7 +1329,7 @@ def load_open_positions() -> dict:
     rows = conn.execute("""
         SELECT market_ticker, entry_price, sell_target, order_id
         FROM trades
-        WHERE exit_price IS NULL AND paper = 1 AND run_id = ?
+        WHERE exit_price IS NULL AND run_id = ?
     """, (current_run_id,)).fetchall()
     conn.close()
     positions: dict = {}

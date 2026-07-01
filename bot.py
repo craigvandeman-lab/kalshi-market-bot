@@ -1354,15 +1354,26 @@ def save_watchlist_to_db(watchlist: dict) -> None:
 
 
 def load_watchlist_from_db() -> dict:
-    tomorrow = _tomorrow_utc_date()
+    today = datetime.now(tz=UTC).date().isoformat()
     conn = sqlite3.connect(DB_PATH)
+    date_row = conn.execute("""
+        SELECT event_date FROM watchlist
+        WHERE event_date >= ?
+        ORDER BY event_date ASC
+        LIMIT 1
+    """, (today,)).fetchone()
+    if not date_row:
+        conn.close()
+        return {}
+
+    target_date = date_row[0]
     rows = conn.execute("""
         SELECT event_ticker, series_ticker, event_date, occurrence_dt,
                bracket_ticker, bracket_label, rank, yes_ask_at_open
         FROM watchlist
         WHERE event_date = ?
         ORDER BY event_ticker, rank
-    """, (tomorrow,)).fetchall()
+    """, (target_date,)).fetchall()
     conn.close()
 
     if not rows:
@@ -2189,17 +2200,24 @@ def main():
             schedule.every(5).minutes.do(_retry_watchlist_build).tag("watchlist_retry")
         watchlist_is_valid = True
     else:
+        today = datetime.now(tz=UTC).date().isoformat()
         watchlist = load_watchlist_from_db()
         if watchlist:
             watchlist_is_valid = True
-            log.info(f"Loaded today's watchlist from DB ({len(watchlist)} events)")
+            loaded_date = next(iter(watchlist.values())).get("event_date", "?")
+            log.info(
+                f"Loaded watchlist from DB for event_date={loaded_date} "
+                f"({len(watchlist)} events, searched event_date >= {today})"
+            )
         else:
             watchlist_is_valid = False
             log.info(
-                "Outside snapshot window and no watchlist for today — waiting for tomorrow at 14:05 UTC"
+                f"Outside snapshot window: no watchlist found for event_date >= {today} "
+                f"(loaded event_date: none) — waiting for next build at 14:05 UTC"
             )
             send_telegram(
-                "⏳ Market Bot started outside snapshot window — waiting for tomorrow's 14:05 UTC open"
+                f"⏳ Market Bot started outside snapshot window — no watchlist for "
+                f"event_date >= {today}; waiting for next build at 14:05 UTC"
             )
 
     if "--run-now" in sys.argv:

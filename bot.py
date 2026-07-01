@@ -52,7 +52,10 @@ KALSHI_API_KEY         = os.getenv("KALSHI_API_KEY") or os.getenv("KALSHI_API_KE
 KALSHI_PRIVATE_KEY_PEM = os.getenv("KALSHI_PRIVATE_KEY_PEM", "")
 KALSHI_BASE_URL        = os.getenv("KALSHI_BASE_URL", "https://trading-api.kalshi.com/trade-api/v2")
 PAPER_TRADING          = os.getenv("PAPER_TRADING", "true").lower() == "true"
-TRADE_AMOUNT_CENTS     = int(os.getenv("TRADE_AMOUNT_CENTS", "500"))
+TRADE_AMOUNT_CENTS     = int(os.getenv("TRADE_AMOUNT_CENTS", "400"))
+TRADE_AMOUNT_CENTS_EARLY = int(os.getenv("TRADE_AMOUNT_CENTS_EARLY", "200"))
+TRADE_AMOUNT_CENTS_LATE  = int(os.getenv("TRADE_AMOUNT_CENTS_LATE", "400"))
+EARLY_PHASE_HOURS        = int(os.getenv("EARLY_PHASE_HOURS", "6"))
 TELEGRAM_BOT_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID       = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -602,6 +605,25 @@ def fetch_wallet_balance() -> float | None:
         return None
 
 
+def get_trade_amount_cents() -> int:
+    now = datetime.now(tz=UTC)
+    market_open_today = now.replace(hour=14, minute=0, second=0, microsecond=0)
+    if now < market_open_today:
+        market_open_today -= timedelta(days=1)
+    hours_since_open = (now - market_open_today).total_seconds() / 3600
+    if hours_since_open < EARLY_PHASE_HOURS:
+        amount = TRADE_AMOUNT_CENTS_EARLY
+        tier = "early"
+    else:
+        amount = TRADE_AMOUNT_CENTS_LATE
+        tier = "late"
+    log.debug(
+        f"Trade size tier={tier} amount_cents={amount} "
+        f"hours_since_open={hours_since_open:.2f} early_phase_hours={EARLY_PHASE_HOURS}"
+    )
+    return amount
+
+
 def can_place_trade() -> bool:
     if not PAPER_TRADING:
         balance = fetch_wallet_balance()
@@ -609,7 +631,7 @@ def can_place_trade() -> bool:
             log.warning("Wallet guard: could not fetch balance — skipping trade")
             return False
 
-        trade_cost = TRADE_AMOUNT_CENTS / 100
+        trade_cost = get_trade_amount_cents() / 100
         projected_balance = balance - cycle_spent - trade_cost
         if projected_balance < MIN_WALLET_BALANCE:
             log.info(
@@ -650,7 +672,7 @@ def should_top_up(ticker: str) -> tuple[bool, float]:
         (entry_price or 0) * (float(volume) if volume else 0)
         for entry_price, volume in rows
     )
-    target_position_size = TRADE_AMOUNT_CENTS / 100
+    target_position_size = get_trade_amount_cents() / 100
     remaining_budget = target_position_size - existing_cost_basis
     if remaining_budget < 0.50:
         return (False, 0.0)
@@ -673,6 +695,7 @@ def place_trade(
 
     ticker        = bracket["ticker"]
     bracket_label = bracket["bracket_label"]
+    trade_dollars = get_trade_amount_cents() / 100
 
     if PAPER_TRADING and ticker in open_positions:
         return
@@ -688,7 +711,7 @@ def place_trade(
         volume        = float(market.get("volume_fp", 0) or 0)
         yes_bid       = float(market.get("yes_bid_dollars", 0) or 0)
         open_interest = float(market.get("open_interest_fp", 0) or 0)
-        contracts  = int((TRADE_AMOUNT_CENTS / 100) / yes_ask)
+        contracts  = int(trade_dollars / yes_ask)
         entry_fee  = calc_taker_fee(yes_ask, contracts)
         slippage   = 0.0
         if record_trade({
@@ -707,7 +730,7 @@ def place_trade(
             "entry_fee":     entry_fee,
             "slippage":      slippage,
         }):
-            cycle_spent += TRADE_AMOUNT_CENTS / 100
+            cycle_spent += trade_dollars
         open_positions[ticker] = {
             "entry":    yes_ask,
             "target":   sell_target,
@@ -721,11 +744,7 @@ def place_trade(
         return
 
     try:
-        buy_dollars = (
-            remaining_budget
-            if remaining_budget is not None
-            else (TRADE_AMOUNT_CENTS / 100)
-        )
+        buy_dollars = remaining_budget if remaining_budget is not None else trade_dollars
         contracts_to_buy = buy_dollars / yes_ask
         buy_resp = kalshi_post("/portfolio/events/orders", {
             "ticker":                     ticker,
@@ -823,7 +842,7 @@ def place_trade(
     event_date    = parse_event_date(ticker)
     incremental_entry_fee = calc_taker_fee(actual_fill_price, filled_qty)
     slippage      = actual_fill_price - yes_ask
-    target_position_size = TRADE_AMOUNT_CENTS / 100
+    target_position_size = trade_dollars
 
     if existing_rows:
         trade_id = existing_rows[0][0]
@@ -872,7 +891,7 @@ def place_trade(
         "entry_fee":     incremental_entry_fee,
         "slippage":      slippage,
     }):
-        cycle_spent += TRADE_AMOUNT_CENTS / 100
+        cycle_spent += trade_dollars
     open_positions[ticker] = {
         "entry":    actual_fill_price,
         "target":   sell_target,
@@ -2148,6 +2167,11 @@ def main():
     log.info(
         f"Config: ENTRY_CAP={ENTRY_CAP} ENTRY_FLOOR={ENTRY_FLOOR} WATCHLIST_SIZE={WATCHLIST_SIZE} "
         f"TARGETS={TARGET_TIER_1}/{TARGET_TIER_2}/{TARGET_TIER_3}/{TARGET_TIER_4}/{TARGET_TIER_5}/{TARGET_TIER_6}"
+    )
+    log.info(
+        f"TRADE_AMOUNT_CENTS_EARLY={TRADE_AMOUNT_CENTS_EARLY} "
+        f"TRADE_AMOUNT_CENTS_LATE={TRADE_AMOUNT_CENTS_LATE} "
+        f"EARLY_PHASE_HOURS={EARLY_PHASE_HOURS}"
     )
     disabled = sorted(s for s, c in SERIES_CONFIG.items() if not c.get("enabled", True))
     if ENABLED_SERIES:

@@ -605,21 +605,36 @@ def fetch_wallet_balance() -> float | None:
         return None
 
 
-def get_trade_amount_cents() -> int:
+def get_trade_amount_cents(market_open_time: str | None = None) -> int:
     now = datetime.now(tz=UTC)
-    market_open_today = now.replace(hour=14, minute=0, second=0, microsecond=0)
-    if now < market_open_today:
-        market_open_today -= timedelta(days=1)
-    hours_since_open = (now - market_open_today).total_seconds() / 3600
-    if hours_since_open < EARLY_PHASE_HOURS:
-        amount = TRADE_AMOUNT_CENTS_EARLY
-        tier = "early"
+    if not market_open_time:
+        log.warning("get_trade_amount_cents: no market open_time, falling back to 14:00 UTC anchor")
+        market_open_today = now.replace(hour=14, minute=0, second=0, microsecond=0)
+        if now < market_open_today:
+            market_open_today -= timedelta(days=1)
+        open_dt = market_open_today
     else:
-        amount = TRADE_AMOUNT_CENTS_LATE
-        tier = "late"
+        try:
+            open_dt = datetime.fromisoformat(str(market_open_time).replace("Z", "+00:00"))
+            if open_dt.tzinfo is None:
+                open_dt = open_dt.replace(tzinfo=UTC)
+            open_dt = open_dt.astimezone(UTC)
+        except (ValueError, TypeError) as e:
+            log.warning(
+                f"get_trade_amount_cents: could not parse open_time={market_open_time!r}: {e} "
+                f"— falling back to 14:00 UTC anchor"
+            )
+            market_open_today = now.replace(hour=14, minute=0, second=0, microsecond=0)
+            if now < market_open_today:
+                market_open_today -= timedelta(days=1)
+            open_dt = market_open_today
+
+    hours_since_open = (now - open_dt).total_seconds() / 3600
+    early = hours_since_open < EARLY_PHASE_HOURS
+    amount = TRADE_AMOUNT_CENTS_EARLY if early else TRADE_AMOUNT_CENTS_LATE
     log.debug(
-        f"Trade size tier={tier} amount_cents={amount} "
-        f"hours_since_open={hours_since_open:.2f} early_phase_hours={EARLY_PHASE_HOURS}"
+        f"Trade size: {'EARLY' if early else 'LATE'} "
+        f"({hours_since_open:.1f}h since market open) = ${amount / 100:.2f}"
     )
     return amount
 
@@ -660,7 +675,7 @@ def reset_cycle_spent() -> None:
     log.debug("Cycle spend tracker reset")
 
 
-def should_top_up(ticker: str) -> tuple[bool, float]:
+def should_top_up(ticker: str, open_time: str | None = None) -> tuple[bool, float]:
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute("""
         SELECT entry_price, volume FROM trades
@@ -672,7 +687,7 @@ def should_top_up(ticker: str) -> tuple[bool, float]:
         (entry_price or 0) * (float(volume) if volume else 0)
         for entry_price, volume in rows
     )
-    target_position_size = get_trade_amount_cents() / 100
+    target_position_size = get_trade_amount_cents(open_time) / 100
     remaining_budget = target_position_size - existing_cost_basis
     if remaining_budget < 0.50:
         return (False, 0.0)
@@ -687,6 +702,7 @@ def place_trade(
     vwap: float | None = None,
     is_mean_bracket: bool = False,
     remaining_budget: float | None = None,
+    open_time: str | None = None,
 ) -> None:
     global cycle_spent
 
@@ -695,7 +711,7 @@ def place_trade(
 
     ticker        = bracket["ticker"]
     bracket_label = bracket["bracket_label"]
-    trade_dollars = get_trade_amount_cents() / 100
+    trade_dollars = get_trade_amount_cents(open_time) / 100
 
     if PAPER_TRADING and ticker in open_positions:
         return
@@ -991,6 +1007,7 @@ def build_watchlist() -> dict:
                 "bracket_label":   _bracket_label(m),
                 "rank":            rank,
                 "yes_ask_at_open": ask,
+                "open_time":       m.get("open_time") or "",
             })
 
         new_watchlist[event_ticker] = {
@@ -1097,6 +1114,7 @@ def run_watchlist_monitor() -> None:
                         f"{series_ticker} | {event_date} | {bracket_label} — skipping, spread too wide"
                     )
                     continue
+                open_time = bracket.get("open_time") or market.get("open_time")
                 if PAPER_TRADING:
                     if ticker in open_positions:
                         log.info(
@@ -1106,7 +1124,7 @@ def run_watchlist_monitor() -> None:
                         continue
                     remaining_budget = None
                 else:
-                    can_top_up, remaining_budget = should_top_up(ticker)
+                    can_top_up, remaining_budget = should_top_up(ticker, open_time)
                     if not can_top_up:
                         log.info(
                             f"{series_ticker} | {event_date} | {bracket_label} — skipping, "
@@ -1126,6 +1144,7 @@ def run_watchlist_monitor() -> None:
                     vwap=None,
                     is_mean_bracket=(rank == 1),
                     remaining_budget=remaining_budget,
+                    open_time=open_time,
                 )
             else:
                 ask_str = f"{yes_ask:.2f}" if yes_ask is not None else "N/A"
@@ -1319,9 +1338,18 @@ def init_db():
             bracket_label   TEXT NOT NULL,
             rank            INTEGER NOT NULL,
             yes_ask_at_open REAL NOT NULL,
+            open_time       TEXT,
             created_at      TEXT DEFAULT (datetime('now'))
         )
     """)
+    watchlist_expected_columns = {
+        "open_time": "TEXT",
+    }
+    watchlist_existing = {row[1] for row in conn.execute("PRAGMA table_info(watchlist)")}
+    for col, col_type in watchlist_expected_columns.items():
+        if col not in watchlist_existing:
+            conn.execute(f"ALTER TABLE watchlist ADD COLUMN {col} {col_type}")
+            log.info(f"Migrated watchlist table: added column {col}")
     conn.commit()
     conn.close()
 
@@ -1337,8 +1365,8 @@ def save_watchlist_to_db(watchlist: dict) -> None:
             conn.execute("""
                 INSERT INTO watchlist
                     (event_ticker, series_ticker, event_date, occurrence_dt,
-                     bracket_ticker, bracket_label, rank, yes_ask_at_open)
-                VALUES (?,?,?,?,?,?,?,?)
+                     bracket_ticker, bracket_label, rank, yes_ask_at_open, open_time)
+                VALUES (?,?,?,?,?,?,?,?,?)
             """, (
                 event_ticker,
                 info["series_ticker"],
@@ -1348,6 +1376,7 @@ def save_watchlist_to_db(watchlist: dict) -> None:
                 bracket["bracket_label"],
                 bracket["rank"],
                 bracket.get("yes_ask_at_open", 0.0),
+                bracket.get("open_time", ""),
             ))
     conn.commit()
     conn.close()
@@ -1369,7 +1398,7 @@ def load_watchlist_from_db() -> dict:
     target_date = date_row[0]
     rows = conn.execute("""
         SELECT event_ticker, series_ticker, event_date, occurrence_dt,
-               bracket_ticker, bracket_label, rank, yes_ask_at_open
+               bracket_ticker, bracket_label, rank, yes_ask_at_open, open_time
         FROM watchlist
         WHERE event_date = ?
         ORDER BY event_ticker, rank
@@ -1382,7 +1411,7 @@ def load_watchlist_from_db() -> dict:
     result: dict = {}
     for (
         event_ticker, series_ticker, event_date, occurrence_dt,
-        bracket_ticker, bracket_label, rank, yes_ask_at_open,
+        bracket_ticker, bracket_label, rank, yes_ask_at_open, open_time,
     ) in rows:
         if event_ticker not in result:
             occ_dt = None
@@ -1405,6 +1434,7 @@ def load_watchlist_from_db() -> dict:
             "bracket_label":   bracket_label,
             "rank":            rank,
             "yes_ask_at_open": yes_ask_at_open,
+            "open_time":       open_time or "",
         })
     return result
 

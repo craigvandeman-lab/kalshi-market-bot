@@ -676,6 +676,29 @@ def reset_cycle_spent() -> None:
 
 
 def should_top_up(ticker: str, open_time: str | None = None) -> tuple[bool, float]:
+    occurrence_dt = None
+    in_watchlist = False
+    for info in watchlist.values():
+        for bracket in info.get("brackets", []):
+            if bracket.get("ticker") == ticker:
+                in_watchlist = True
+                occurrence_dt = info.get("occurrence_dt")
+                break
+        if in_watchlist:
+            break
+
+    if not in_watchlist:
+        log.debug(
+            f"Top-up blocked for {ticker} — not found in active watchlist"
+        )
+        return (False, 0.0)
+
+    if occurrence_dt and is_within_cutoff(occurrence_dt):
+        log.debug(
+            f"Top-up blocked for {ticker} — within cutoff of occurrence {occurrence_dt}"
+        )
+        return (False, 0.0)
+
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute("""
         SELECT entry_price, volume FROM trades

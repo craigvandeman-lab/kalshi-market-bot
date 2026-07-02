@@ -1178,6 +1178,69 @@ def run_watchlist_monitor() -> None:
     last_cycle_at = datetime.now(tz=UTC)
 
 
+def record_price_snapshot(
+    market_ticker: str,
+    series_ticker: str,
+    temp_type: str,
+    yes_ask: float | None,
+    yes_bid: float | None,
+    last_price: float | None,
+) -> None:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("""
+            INSERT INTO price_history
+                (market_ticker, series_ticker, temp_type, yes_ask, yes_bid, last_price, run_id)
+            VALUES (?,?,?,?,?,?,?)
+        """, (
+            market_ticker, series_ticker, temp_type,
+            yes_ask, yes_bid, last_price, current_run_id,
+        ))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.debug(f"record_price_snapshot failed for {market_ticker}: {e}")
+
+
+def run_price_history_capture() -> None:
+    if not watchlist_is_valid or not watchlist:
+        return
+
+    count = 0
+    for info in watchlist.values():
+        series_ticker = info.get("series_ticker", "")
+        temp_type = "HIGH" if "HIGH" in series_ticker else "LOW"
+        for bracket in info.get("brackets", []):
+            ticker = bracket["ticker"]
+            try:
+                data = kalshi_get(f"/markets/{ticker}")
+                market = data.get("market", {})
+            except Exception as e:
+                log.debug(f"price history fetch failed for {ticker}: {e}")
+                time.sleep(0.25)
+                continue
+
+            yes_ask = get_yes_ask(market)
+            yes_bid_raw = market.get("yes_bid_dollars")
+            try:
+                yes_bid = float(yes_bid_raw) if yes_bid_raw not in (None, "") else None
+            except (TypeError, ValueError):
+                yes_bid = None
+            last_price_raw = market.get("last_price_dollars")
+            try:
+                last_price = float(last_price_raw) if last_price_raw not in (None, "") else None
+            except (TypeError, ValueError):
+                last_price = None
+
+            record_price_snapshot(
+                ticker, series_ticker, temp_type, yes_ask, yes_bid, last_price,
+            )
+            count += 1
+            time.sleep(0.25)
+
+    log.info(f"Price history: recorded {count} snapshots")
+
+
 # ENSEMBLE — not used in market-based strategy
 # def run_ensemble_update() -> dict:
 #     watched: dict = {}
@@ -1373,6 +1436,23 @@ def init_db():
         if col not in watchlist_existing:
             conn.execute(f"ALTER TABLE watchlist ADD COLUMN {col} {col_type}")
             log.info(f"Migrated watchlist table: added column {col}")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS price_history (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            market_ticker   TEXT NOT NULL,
+            series_ticker   TEXT NOT NULL,
+            temp_type       TEXT NOT NULL,
+            yes_ask         REAL,
+            yes_bid         REAL,
+            last_price      REAL,
+            observed_at     TEXT DEFAULT (datetime('now')),
+            run_id          INTEGER
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_price_history_ticker_time
+        ON price_history (market_ticker, observed_at)
+    """)
     conn.commit()
     conn.close()
 
@@ -2311,11 +2391,13 @@ def main():
     schedule.every().day.at("14:05").do(_scheduled_build_watchlist)
     schedule.every(SCAN_INTERVAL_MINUTES).minutes.do(_scheduled_watchlist_monitor)
     schedule.every(SCAN_INTERVAL_MINUTES).minutes.do(check_fills)
+    schedule.every(SCAN_INTERVAL_MINUTES).minutes.do(run_price_history_capture)
     schedule.every(10).minutes.do(check_health)
     schedule.every().day.at("12:00").do(send_daily_summary)
     schedule.every(5).seconds.do(handle_telegram_commands)
     log.info(
-        f"Scheduled: watchlist build daily 14:05 UTC; monitor + fills every {SCAN_INTERVAL_MINUTES} min; "
+        f"Scheduled: watchlist build daily 14:05 UTC; monitor + fills + price history "
+        f"every {SCAN_INTERVAL_MINUTES} min; "
         "health check every 10 min; daily summary 12:00 UTC; Telegram every 5s"
     )
 

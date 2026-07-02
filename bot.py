@@ -1820,6 +1820,10 @@ def check_fills() -> None:
                     close_trade(trade_id, exit_price, "RECONCILED_SETTLEMENT", exit_fee=exit_fee)
                     open_positions.pop(market_ticker, None)
                     send_telegram(f"🔁 Sell order expired but market settled: {market_ticker}")
+                elif market_status == "closed":
+                    log.info(f"Market closed, awaiting settlement: {market_ticker}")
+                    time.sleep(0.25)
+                    continue
                 else:
                     yes_ask = get_yes_ask(market)
                     recovery_target = get_sell_target(entry_price)

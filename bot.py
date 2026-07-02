@@ -1800,37 +1800,54 @@ def check_fills() -> None:
                 conn.close()
             elif status in ("cancelled", "expired", "canceled"):
                 try:
-                    mdata  = kalshi_get(f"/markets/{market_ticker}")
-                    market = mdata.get("market", {})
+                    market_data = kalshi_get(f"/markets/{market_ticker}")
+                    market = market_data.get("market", {})
                 except Exception as e:
                     log.warning(
                         f"check_fills: market fetch failed for expired sell on {market_ticker}: {e}"
-                    )
-                    send_telegram(
-                        f"⚠️ Could not replace sell order for {market_ticker} — manual review needed"
                     )
                     time.sleep(0.25)
                     continue
 
                 market_status = market.get("status", "")
+
                 if market_status in ("settled", "finalized"):
-                    win        = market.get("result", "") == "yes"
+                    win = market.get("result", "") == "yes"
                     exit_price = 1.00 if win else 0.00
                     exit_fee = calc_maker_fee(exit_price, fee_contracts)
                     close_trade(trade_id, exit_price, "RECONCILED_SETTLEMENT", exit_fee=exit_fee)
                     open_positions.pop(market_ticker, None)
-                    send_telegram(f"🔁 Sell order expired but market settled: {market_ticker}")
-                elif market_status == "closed":
-                    log.info(f"Market closed, awaiting settlement: {market_ticker}")
+                    pnl = _trade_pnl(
+                        entry_price, exit_price,
+                        entry_fee=entry_fee, exit_fee=exit_fee,
+                        contracts=fee_contracts,
+                    )
+                    if win:
+                        send_telegram(
+                            f"✅ Settled WIN [LIVE]\n"
+                            f"{series_ticker} | {event_date} | {bracket_label}\n"
+                            f"PnL: +${pnl:.2f}"
+                        )
+                    else:
+                        send_telegram(
+                            f"❌ Settled LOSS [LIVE]\n"
+                            f"{series_ticker} | {event_date} | {bracket_label}\n"
+                            f"PnL: -${abs(pnl):.2f}"
+                        )
                     time.sleep(0.25)
                     continue
+
+                elif market_status == "closed":
+                    log.info(
+                        f"Sell order expired, market closed awaiting settlement: "
+                        f"{market_ticker} — will check again next cycle"
+                    )
+                    time.sleep(0.25)
+                    continue
+
                 else:
                     yes_ask = get_yes_ask(market)
                     recovery_target = get_sell_target(entry_price)
-                    log.debug(
-                        f"Replacing expired sell for {market_ticker}: yes_ask={yes_ask}, "
-                        f"target={recovery_target:.2f}"
-                    )
                     try:
                         sell_resp = kalshi_post("/portfolio/events/orders", {
                             "ticker":                     market_ticker,
@@ -1844,23 +1861,25 @@ def check_fills() -> None:
                         new_order_id = sell_resp.get("order_id", "UNKNOWN")
                         conn = sqlite3.connect(DB_PATH)
                         conn.execute(
-                            "UPDATE trades SET sell_order_id = ?, last_known_fill_count = 0 WHERE id = ?",
+                            "UPDATE trades SET sell_order_id = ? WHERE id = ?",
                             (new_order_id, trade_id),
                         )
                         conn.commit()
                         conn.close()
                         log.info(
-                            f"Replaced expired sell order for {market_ticker} → new order {new_order_id}"
+                            f"Replaced expired sell for {market_ticker} → new order {new_order_id}"
                         )
                         send_telegram(
                             f"🔄 Replaced expired sell order\n"
                             f"{market_ticker} target: ${recovery_target:.2f}"
                         )
                     except Exception as e:
-                        log.error(f"Could not replace sell order for {market_ticker}: {e}")
-                        send_telegram(
-                            f"⚠️ Could not replace sell order for {market_ticker} — manual review needed"
+                        log.warning(
+                            f"Failed to replace sell order for {market_ticker}: {e} — "
+                            f"will retry next cycle"
                         )
+                    time.sleep(0.25)
+                    continue
 
             time.sleep(0.25)
 

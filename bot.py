@@ -1488,24 +1488,13 @@ def save_watchlist_to_db(watchlist: dict) -> None:
 def load_watchlist_from_db() -> dict:
     today = datetime.now(tz=UTC).date().isoformat()
     conn = sqlite3.connect(DB_PATH)
-    date_row = conn.execute("""
-        SELECT event_date FROM watchlist
-        WHERE event_date >= ?
-        ORDER BY event_date ASC
-        LIMIT 1
-    """, (today,)).fetchone()
-    if not date_row:
-        conn.close()
-        return {}
-
-    target_date = date_row[0]
     rows = conn.execute("""
         SELECT event_ticker, series_ticker, event_date, occurrence_dt,
                bracket_ticker, bracket_label, rank, yes_ask_at_open, open_time
         FROM watchlist
-        WHERE event_date = ?
+        WHERE event_date >= ?
         ORDER BY event_ticker, rank
-    """, (target_date,)).fetchall()
+    """, (today,)).fetchall()
     conn.close()
 
     if not rows:
@@ -2349,32 +2338,39 @@ def main():
     send_telegram(f"🤖 Kalshi Market Bot started | PAPER={PAPER_TRADING}")
     handle_telegram_commands()
 
-    if is_open_snapshot_window():
-        log.info("Building fresh watchlist in snapshot window")
+    watchlist = load_watchlist_from_db()
+
+    tomorrow = _tomorrow_utc_date()
+    conn = sqlite3.connect(DB_PATH)
+    tomorrow_count = conn.execute(
+        "SELECT COUNT(*) FROM watchlist WHERE event_date = ?",
+        (tomorrow,),
+    ).fetchone()[0]
+    conn.close()
+
+    now = datetime.now(tz=UTC)
+    past_snapshot_time = (now.hour > 14) or (now.hour == 14 and now.minute >= 5)
+    should_build = past_snapshot_time and tomorrow_count == 0
+
+    if should_build:
+        log.info("Startup: past 14:05 UTC and no tomorrow watchlist found — building now")
         if not try_build_watchlist():
             schedule.clear("watchlist_retry")
             schedule.every(5).minutes.do(_retry_watchlist_build).tag("watchlist_retry")
-        watchlist_is_valid = True
-    else:
-        today = datetime.now(tz=UTC).date().isoformat()
         watchlist = load_watchlist_from_db()
-        if watchlist:
-            watchlist_is_valid = True
-            loaded_date = next(iter(watchlist.values())).get("event_date", "?")
-            log.info(
-                f"Loaded watchlist from DB for event_date={loaded_date} "
-                f"({len(watchlist)} events, searched event_date >= {today})"
-            )
-        else:
-            watchlist_is_valid = False
-            log.info(
-                f"Outside snapshot window: no watchlist found for event_date >= {today} "
-                f"(loaded event_date: none) — waiting for next build at 14:05 UTC"
-            )
-            send_telegram(
-                f"⏳ Market Bot started outside snapshot window — no watchlist for "
-                f"event_date >= {today}; waiting for next build at 14:05 UTC"
-            )
+        watchlist_is_valid = True
+    elif watchlist:
+        watchlist_is_valid = True
+        dates = sorted(set(info.get("event_date") for info in watchlist.values()))
+        log.info(
+            f"Loaded watchlist from DB: {len(watchlist)} events across dates {dates}"
+        )
+    else:
+        watchlist_is_valid = False
+        log.info("No watchlist found and before snapshot window — waiting for 14:05 UTC")
+        send_telegram(
+            "⏳ Market Bot started — no watchlist found; waiting for 14:05 UTC build"
+        )
 
     if "--run-now" in sys.argv:
         run_watchlist_monitor()

@@ -440,6 +440,26 @@ def get_yes_ask(market: dict) -> float | None:
     return val if val > 0 else None
 
 
+def get_yes_buy_depth(market_ticker: str, sell_target: float) -> float:
+    try:
+        data = kalshi_get(f"/markets/{market_ticker}/orderbook")
+        orderbook_fp = data.get("orderbook_fp") or {}
+        no_dollars = orderbook_fp.get("no_dollars") or []
+        max_no_price = 1.0 - sell_target
+        total = 0.0
+        for entry in no_dollars:
+            if not entry or len(entry) < 2:
+                continue
+            no_price = float(entry[0])
+            size = float(entry[1])
+            if no_price <= max_no_price:
+                total += size
+        return total
+    except Exception as e:
+        log.warning(f"get_yes_buy_depth failed for {market_ticker}: {e}")
+        return 0.0
+
+
 def parse_event_date(market_ticker: str) -> str:
     parts = market_ticker.split("-")
     if len(parts) < 2:
@@ -782,9 +802,44 @@ def place_trade(
         )
         return
 
+    existing_rows: list = []
+    top_up_buy_depth: float | None = None
     try:
         buy_dollars = remaining_budget if remaining_budget is not None else trade_dollars
         contracts_to_buy = buy_dollars / yes_ask
+
+        conn = sqlite3.connect(DB_PATH)
+        existing_rows = conn.execute("""
+            SELECT id, entry_price, volume, sell_order_id, entry_fee
+            FROM trades
+            WHERE market_ticker = ? AND exit_price IS NULL AND run_id = ?
+            ORDER BY id DESC
+        """, (ticker, current_run_id)).fetchall()
+        conn.close()
+
+        if existing_rows:
+            existing_cost_basis = sum(
+                (row[1] or 0) * (float(row[2]) if row[2] else 0)
+                for row in existing_rows
+            )
+            existing_total_contracts = sum(
+                float(row[2]) if row[2] else 0 for row in existing_rows
+            )
+            new_total_contracts = existing_total_contracts + contracts_to_buy
+            projected_blended_entry = (
+                (existing_cost_basis + (contracts_to_buy * yes_ask)) / new_total_contracts
+            )
+            new_sell_target = get_sell_target(projected_blended_entry)
+            buy_depth = get_yes_buy_depth(ticker, new_sell_target)
+            if buy_depth < new_total_contracts:
+                log.info(
+                    f"Top-up orderbook gate: {ticker} buy_depth={buy_depth:.1f} "
+                    f"< new_total={new_total_contracts:.1f} at target={new_sell_target:.2f} "
+                    f"— skipping top-up"
+                )
+                return
+            top_up_buy_depth = buy_depth
+
         buy_resp = kalshi_post("/portfolio/events/orders", {
             "ticker":                     ticker,
             "client_order_id":            str(uuid.uuid4()),
@@ -803,15 +858,6 @@ def place_trade(
         if actual_fill_price is None:
             log.warning(f"Could not extract fill price for {ticker}, falling back to yes_ask")
             actual_fill_price = yes_ask
-
-        conn = sqlite3.connect(DB_PATH)
-        existing_rows = conn.execute("""
-            SELECT id, entry_price, volume, sell_order_id, entry_fee
-            FROM trades
-            WHERE market_ticker = ? AND exit_price IS NULL AND run_id = ?
-            ORDER BY id DESC
-        """, (ticker, current_run_id)).fetchall()
-        conn.close()
 
         if existing_rows:
             existing_cost_basis = sum(
@@ -909,7 +955,8 @@ def place_trade(
             f"{series_ticker} | {event_date} | {bracket_label}\n"
             f"New blended entry: ${new_blended_entry:.3f} | New target: ${new_sell_target:.2f} | "
             f"Total qty: {new_total_contracts:.0f} (${new_total_contracts * new_blended_entry:.2f} of "
-            f"${target_position_size:.2f} target)"
+            f"${target_position_size:.2f} target)\n"
+            f"Book depth at target: {top_up_buy_depth:.0f} contracts"
         )
         return
 

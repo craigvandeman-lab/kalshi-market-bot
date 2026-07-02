@@ -76,6 +76,8 @@ MIN_WALLET_BALANCE = float(os.getenv("MIN_WALLET_BALANCE", "50.00"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "999"))
 ENABLED_SERIES     = os.getenv("ENABLED_SERIES", "")
 SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "2"))
+LOW_CUTOFF_LOCAL_HOUR = int(os.getenv("LOW_CUTOFF_LOCAL_HOUR", "9"))
+LOW_CUTOFF_PACIFIC_UTC = int(os.getenv("LOW_CUTOFF_PACIFIC_UTC", "20"))
 
 EASTERN = ZoneInfo("America/New_York")
 UTC     = ZoneInfo("UTC")
@@ -414,6 +416,21 @@ def is_within_cutoff(occurrence_dt: datetime) -> bool:
     return datetime.now(tz=UTC) >= occurrence_dt - timedelta(hours=1)
 
 
+def is_low_temp_cutoff(series_ticker: str) -> bool:
+    if "HIGH" in series_ticker:
+        return False
+    cfg = SERIES_CONFIG.get(series_ticker, {})
+    tz_str = cfg.get("timezone", "America/New_York")
+    if tz_str == "America/Los_Angeles":
+        active = datetime.now(tz=UTC).hour >= LOW_CUTOFF_PACIFIC_UTC
+    else:
+        local_time = datetime.now(tz=UTC).astimezone(ZoneInfo(tz_str))
+        active = local_time.hour >= LOW_CUTOFF_LOCAL_HOUR
+    if active:
+        log.debug(f"LOW cutoff active for {series_ticker} ({tz_str})")
+    return active
+
+
 def is_open_snapshot_window() -> bool:
     now = datetime.now(tz=UTC)
     return now.hour == 14 and 5 <= now.minute < 15
@@ -717,6 +734,11 @@ def should_top_up(ticker: str, open_time: str | None = None) -> tuple[bool, floa
         log.debug(
             f"Top-up blocked for {ticker} — within cutoff of occurrence {occurrence_dt}"
         )
+        return (False, 0.0)
+
+    series_ticker = parse_series_from_ticker(ticker)
+    if not PAPER_TRADING and is_low_temp_cutoff(series_ticker):
+        log.debug(f"Top-up blocked for {ticker} — LOW temp cutoff reached")
         return (False, 0.0)
 
     conn = sqlite3.connect(DB_PATH)
@@ -1149,6 +1171,13 @@ def run_watchlist_monitor() -> None:
             log.info(
                 f"{series_ticker} | {event_date} | all — skipping, "
                 f"within 1h cutoff (occurrence={occurrence_dt})"
+            )
+            continue
+
+        if not PAPER_TRADING and is_low_temp_cutoff(series_ticker):
+            event_date = info.get("event_date", "—")
+            log.debug(
+                f"{series_ticker} | {event_date} | skipping — LOW temp cutoff reached"
             )
             continue
 
@@ -2374,7 +2403,9 @@ def main():
     log.info(
         f"TRADE_AMOUNT_CENTS_EARLY={TRADE_AMOUNT_CENTS_EARLY} "
         f"TRADE_AMOUNT_CENTS_LATE={TRADE_AMOUNT_CENTS_LATE} "
-        f"EARLY_PHASE_HOURS={EARLY_PHASE_HOURS}"
+        f"EARLY_PHASE_HOURS={EARLY_PHASE_HOURS} "
+        f"LOW_CUTOFF_LOCAL_HOUR={LOW_CUTOFF_LOCAL_HOUR} "
+        f"LOW_CUTOFF_PACIFIC_UTC={LOW_CUTOFF_PACIFIC_UTC}"
     )
     disabled = sorted(s for s, c in SERIES_CONFIG.items() if not c.get("enabled", True))
     if ENABLED_SERIES:

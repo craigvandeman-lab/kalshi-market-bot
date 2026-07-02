@@ -78,6 +78,8 @@ ENABLED_SERIES     = os.getenv("ENABLED_SERIES", "")
 SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "2"))
 LOW_CUTOFF_LOCAL_HOUR = int(os.getenv("LOW_CUTOFF_LOCAL_HOUR", "9"))
 LOW_CUTOFF_PACIFIC_UTC = int(os.getenv("LOW_CUTOFF_PACIFIC_UTC", "20"))
+HIGH_CUTOFF_LOCAL_HOUR = int(os.getenv("HIGH_CUTOFF_LOCAL_HOUR", "16"))
+HIGH_CUTOFF_PACIFIC_UTC = int(os.getenv("HIGH_CUTOFF_PACIFIC_UTC", "23"))
 
 EASTERN = ZoneInfo("America/New_York")
 UTC     = ZoneInfo("UTC")
@@ -416,18 +418,24 @@ def is_within_cutoff(occurrence_dt: datetime) -> bool:
     return datetime.now(tz=UTC) >= occurrence_dt - timedelta(hours=1)
 
 
-def is_low_temp_cutoff(series_ticker: str) -> bool:
-    if "HIGH" in series_ticker:
-        return False
+def is_temp_cutoff(series_ticker: str) -> bool:
+    temp_type = "HIGH" if "HIGH" in series_ticker else "LOW"
     cfg = SERIES_CONFIG.get(series_ticker, {})
     tz_str = cfg.get("timezone", "America/New_York")
-    if tz_str == "America/Los_Angeles":
-        active = datetime.now(tz=UTC).hour >= LOW_CUTOFF_PACIFIC_UTC
+    if temp_type == "HIGH":
+        if tz_str == "America/Los_Angeles":
+            active = datetime.now(tz=UTC).hour >= HIGH_CUTOFF_PACIFIC_UTC
+        else:
+            local_time = datetime.now(tz=UTC).astimezone(ZoneInfo(tz_str))
+            active = local_time.hour >= HIGH_CUTOFF_LOCAL_HOUR
     else:
-        local_time = datetime.now(tz=UTC).astimezone(ZoneInfo(tz_str))
-        active = local_time.hour >= LOW_CUTOFF_LOCAL_HOUR
+        if tz_str == "America/Los_Angeles":
+            active = datetime.now(tz=UTC).hour >= LOW_CUTOFF_PACIFIC_UTC
+        else:
+            local_time = datetime.now(tz=UTC).astimezone(ZoneInfo(tz_str))
+            active = local_time.hour >= LOW_CUTOFF_LOCAL_HOUR
     if active:
-        log.debug(f"LOW cutoff active for {series_ticker} ({tz_str})")
+        log.debug(f"{temp_type} cutoff active for {series_ticker} ({tz_str})")
     return active
 
 
@@ -737,8 +745,8 @@ def should_top_up(ticker: str, open_time: str | None = None) -> tuple[bool, floa
         return (False, 0.0)
 
     series_ticker = parse_series_from_ticker(ticker)
-    if not PAPER_TRADING and is_low_temp_cutoff(series_ticker):
-        log.debug(f"Top-up blocked for {ticker} — LOW temp cutoff reached")
+    if not PAPER_TRADING and is_temp_cutoff(series_ticker):
+        log.debug(f"Top-up blocked for {ticker} — temp cutoff reached")
         return (False, 0.0)
 
     conn = sqlite3.connect(DB_PATH)
@@ -1174,10 +1182,10 @@ def run_watchlist_monitor() -> None:
             )
             continue
 
-        if not PAPER_TRADING and is_low_temp_cutoff(series_ticker):
+        if not PAPER_TRADING and is_temp_cutoff(series_ticker):
             event_date = info.get("event_date", "—")
             log.debug(
-                f"{series_ticker} | {event_date} | skipping — LOW temp cutoff reached"
+                f"{series_ticker} | {event_date} | skipping — temp cutoff reached"
             )
             continue
 
@@ -2405,7 +2413,9 @@ def main():
         f"TRADE_AMOUNT_CENTS_LATE={TRADE_AMOUNT_CENTS_LATE} "
         f"EARLY_PHASE_HOURS={EARLY_PHASE_HOURS} "
         f"LOW_CUTOFF_LOCAL_HOUR={LOW_CUTOFF_LOCAL_HOUR} "
-        f"LOW_CUTOFF_PACIFIC_UTC={LOW_CUTOFF_PACIFIC_UTC}"
+        f"LOW_CUTOFF_PACIFIC_UTC={LOW_CUTOFF_PACIFIC_UTC} "
+        f"HIGH_CUTOFF_LOCAL_HOUR={HIGH_CUTOFF_LOCAL_HOUR} "
+        f"HIGH_CUTOFF_PACIFIC_UTC={HIGH_CUTOFF_PACIFIC_UTC}"
     )
     disabled = sorted(s for s, c in SERIES_CONFIG.items() if not c.get("enabled", True))
     if ENABLED_SERIES:

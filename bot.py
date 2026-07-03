@@ -2068,26 +2068,38 @@ def send_daily_summary() -> None:
         WHERE exit_price IS NULL AND run_id = ?
     """, (current_run_id,)).fetchone()[0]
 
-    open_partial = conn.execute("""
-        SELECT realized_pnl
+    total_pnl = conn.execute("""
+        SELECT
+            COALESCE(SUM(CASE
+                WHEN closed_at >= datetime('now', '-24 hours')
+                THEN (exit_price - entry_price) * volume
+                ELSE 0
+            END), 0.0)
+            + COALESCE(SUM(CASE
+                WHEN exit_price IS NULL
+                THEN realized_pnl
+                ELSE 0
+            END), 0.0)
+            - COALESCE(SUM(CASE
+                WHEN closed_at >= datetime('now', '-24 hours')
+                THEN entry_fee
+                ELSE 0
+            END), 0.0)
+            - COALESCE(SUM(CASE
+                WHEN closed_at >= datetime('now', '-24 hours')
+                THEN COALESCE(exit_fee, 0.0)
+                ELSE 0
+            END), 0.0)
         FROM trades
-        WHERE exit_price IS NULL AND run_id = ? AND realized_pnl IS NOT NULL
-    """, (current_run_id,)).fetchall()
+        WHERE run_id = ? AND paper = 0
+          AND (closed_at >= datetime('now', '-24 hours') OR exit_price IS NULL)
+    """, (current_run_id,)).fetchone()[0] or 0.0
 
     conn.close()
 
     target_hits = sum(1 for r in recent_closed if r["exit_reason"] == "SELL_TARGET")
     settled_wins = sum(1 for r in recent_closed if r["exit_reason"] == "SETTLED_WIN")
     settled_losses = sum(1 for r in recent_closed if r["exit_reason"] == "SETTLED_LOSS")
-    total_pnl = sum(
-        _trade_pnl(
-            r["entry_price"], r["exit_price"],
-            entry_fee=r["entry_fee"] or 0.0,
-            exit_fee=r["exit_fee"] or 0.0,
-            contracts=_contracts_from_volume(r["volume"]),
-        )
-        for r in recent_closed
-    ) + sum(r["realized_pnl"] or 0.0 for r in open_partial)
     pnl_str = f"+${total_pnl:.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):.2f}"
 
     send_telegram(
@@ -2202,68 +2214,76 @@ def build_telegram_dashboard() -> str:
     """, (current_run_id,)).fetchall()
 
     sell_target_wins = conn.execute("""
-        SELECT entry_price, exit_price, entry_fee, exit_fee, volume
+        SELECT COUNT(*)
         FROM trades
-        WHERE exit_reason = 'SELL_TARGET' AND exit_price IS NOT NULL AND run_id = ?
-    """, (current_run_id,)).fetchall()
+        WHERE exit_reason = 'SELL_TARGET' AND exit_price IS NOT NULL
+          AND run_id = ? AND paper = 0
+    """, (current_run_id,)).fetchone()[0]
 
     settled_wins = conn.execute("""
-        SELECT entry_price, exit_price, entry_fee, exit_fee, volume
+        SELECT COUNT(*)
         FROM trades
-        WHERE exit_reason = 'SETTLED_WIN' AND exit_price IS NOT NULL AND run_id = ?
-    """, (current_run_id,)).fetchall()
+        WHERE exit_reason = 'SETTLED_WIN' AND exit_price IS NOT NULL
+          AND run_id = ? AND paper = 0
+    """, (current_run_id,)).fetchone()[0]
 
     settled_losses = conn.execute("""
-        SELECT entry_price, exit_price, entry_fee, exit_fee, volume
+        SELECT COUNT(*)
         FROM trades
-        WHERE exit_reason = 'SETTLED_LOSS' AND exit_price IS NOT NULL AND run_id = ?
-    """, (current_run_id,)).fetchall()
+        WHERE exit_reason = 'SETTLED_LOSS' AND exit_price IS NOT NULL
+          AND run_id = ? AND paper = 0
+    """, (current_run_id,)).fetchone()[0]
 
-    all_closed = conn.execute("""
-        SELECT entry_price, exit_price, entry_fee, exit_fee, volume
+    avg_target_hit_pnl = conn.execute("""
+        SELECT COALESCE(
+            AVG((exit_price - entry_price) * volume - entry_fee - COALESCE(exit_fee, 0.0)),
+            0.0
+        )
         FROM trades
-        WHERE exit_price IS NOT NULL AND run_id = ?
-    """, (current_run_id,)).fetchall()
+        WHERE exit_reason = 'SELL_TARGET' AND run_id = ? AND paper = 0
+    """, (current_run_id,)).fetchone()[0] or 0.0
 
-    open_partial = conn.execute("""
-        SELECT realized_pnl
+    avg_settled_win_pnl = conn.execute("""
+        SELECT COALESCE(
+            AVG((exit_price - entry_price) * volume - entry_fee - COALESCE(exit_fee, 0.0)),
+            0.0
+        )
         FROM trades
-        WHERE exit_price IS NULL AND run_id = ? AND realized_pnl IS NOT NULL
-    """, (current_run_id,)).fetchall()
+        WHERE exit_reason = 'SETTLED_WIN' AND run_id = ? AND paper = 0
+    """, (current_run_id,)).fetchone()[0] or 0.0
+
+    avg_settled_loss_pnl = conn.execute("""
+        SELECT COALESCE(
+            AVG((exit_price - entry_price) * volume - entry_fee - COALESCE(exit_fee, 0.0)),
+            0.0
+        )
+        FROM trades
+        WHERE exit_reason IN ('SETTLED_LOSS', 'RECONCILED_SETTLEMENT')
+          AND exit_price = 0.0 AND run_id = ? AND paper = 0
+    """, (current_run_id,)).fetchone()[0] or 0.0
+
+    total_pnl = conn.execute("""
+        SELECT
+            COALESCE(SUM((exit_price - entry_price) * volume), 0.0)
+            + COALESCE(SUM(realized_pnl), 0.0)
+            - COALESCE(SUM(entry_fee), 0.0)
+            - COALESCE(SUM(COALESCE(exit_fee, 0.0)), 0.0)
+        FROM trades
+        WHERE run_id = ? AND paper = 0
+    """, (current_run_id,)).fetchone()[0] or 0.0
 
     conn.close()
 
     now = datetime.now(tz=EASTERN)
-    total_pnl = sum(
-        _trade_pnl(
-            r["entry_price"], r["exit_price"],
-            entry_fee=r["entry_fee"] or 0.0,
-            exit_fee=r["exit_fee"] or 0.0,
-            contracts=int(float(r["volume"])) if r["volume"] else None,
-        )
-        for r in all_closed
-    ) + sum(r["realized_pnl"] or 0.0 for r in open_partial)
-    win_rows = [
-        (r["entry_price"], r["exit_price"], r["entry_fee"], r["exit_fee"], r["volume"])
-        for r in sell_target_wins
-    ]
-    settled_win_rows = [
-        (r["entry_price"], r["exit_price"], r["entry_fee"], r["exit_fee"], r["volume"])
-        for r in settled_wins
-    ]
-    loss_rows = [
-        (r["entry_price"], r["exit_price"], r["entry_fee"], r["exit_fee"], r["volume"])
-        for r in settled_losses
-    ]
     total_pnl_str = f"+${total_pnl:.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):.2f}"
 
     lines = [
         f"📊 *Dip Bot* | Run #{current_run_id} | {now.strftime('%Y-%m-%d')} {now.strftime('%H:%M')} ET",
         "",
         f"💼 Open: {len(open_rows)}",
-        f"🎯 Target hits: {len(sell_target_wins)} avg +${_avg_pnl(win_rows):.2f}",
-        f"✅ Settled wins: {len(settled_wins)} avg +${_avg_pnl(settled_win_rows):.2f}",
-        f"❌ Settled losses: {len(settled_losses)} avg -${abs(_avg_pnl(loss_rows)):.2f}",
+        f"🎯 Target hits: {sell_target_wins} avg +${avg_target_hit_pnl:.2f}",
+        f"✅ Settled wins: {settled_wins} avg +${avg_settled_win_pnl:.2f}",
+        f"❌ Settled losses: {settled_losses} avg -${abs(avg_settled_loss_pnl):.2f}",
         f"💰 Total PnL: {total_pnl_str}",
         "",
         "*Recent open positions:*",

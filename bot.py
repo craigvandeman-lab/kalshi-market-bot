@@ -2213,12 +2213,28 @@ def build_telegram_dashboard() -> str:
         ORDER BY entry_price ASC
     """, (current_run_id,)).fetchall()
 
-    target_hits_count = conn.execute("""
-        SELECT COUNT(*)
+    full_hits_pnl, full_hits_count = conn.execute("""
+        SELECT
+            COALESCE(SUM((exit_price - entry_price) * volume - entry_fee - COALESCE(exit_fee, 0.0)), 0.0),
+            COUNT(*)
         FROM trades
-        WHERE exit_reason = 'SELL_TARGET' AND exit_price IS NOT NULL
+        WHERE exit_reason = 'SELL_TARGET'
           AND run_id = ? AND paper = 0
-    """, (current_run_id,)).fetchone()[0]
+    """, (current_run_id,)).fetchone()
+
+    partial_hits_pnl, partial_hits_count = conn.execute("""
+        SELECT
+            COALESCE(SUM(realized_pnl), 0.0),
+            COUNT(*)
+        FROM trades
+        WHERE exit_reason != 'SELL_TARGET'
+          AND realized_pnl > 0
+          AND run_id = ? AND paper = 0
+    """, (current_run_id,)).fetchone()
+
+    total_hit_count = full_hits_count + partial_hits_count
+    total_hit_pnl = (full_hits_pnl or 0.0) + (partial_hits_pnl or 0.0)
+    avg_target_hit_pnl = total_hit_pnl / total_hit_count if total_hit_count > 0 else 0.0
 
     settled_losses_count = conn.execute("""
         SELECT COUNT(*)
@@ -2227,15 +2243,6 @@ def build_telegram_dashboard() -> str:
           AND exit_reason IN ('SETTLED_LOSS', 'RECONCILED_SETTLEMENT')
           AND run_id = ? AND paper = 0
     """, (current_run_id,)).fetchone()[0]
-
-    avg_target_hit_pnl = conn.execute("""
-        SELECT COALESCE(
-            AVG((exit_price - entry_price) * volume - entry_fee - COALESCE(exit_fee, 0.0)),
-            0.0
-        )
-        FROM trades
-        WHERE exit_reason = 'SELL_TARGET' AND run_id = ? AND paper = 0
-    """, (current_run_id,)).fetchone()[0] or 0.0
 
     avg_settled_loss = conn.execute("""
         SELECT COALESCE(
@@ -2262,14 +2269,14 @@ def build_telegram_dashboard() -> str:
 
     now = datetime.now(tz=EASTERN)
     total_pnl_str = f"+${total_pnl:.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):.2f}"
-    total_closed = target_hits_count + settled_losses_count
-    win_rate = (target_hits_count / total_closed * 100) if total_closed > 0 else 0.0
+    total_closed = total_hit_count + settled_losses_count
+    win_rate = (total_hit_count / total_closed * 100) if total_closed > 0 else 0.0
 
     lines = [
         f"📊 *Dip Bot* | Run #{current_run_id} | {now.strftime('%Y-%m-%d')} {now.strftime('%H:%M')} ET",
         "",
         f"💼 Open: {len(open_rows)}",
-        f"🎯 Target hits: {target_hits_count} avg +${avg_target_hit_pnl:.2f}",
+        f"🎯 Target hits: {total_hit_count} avg +${avg_target_hit_pnl:.2f}",
         f"❌ Settled losses: {settled_losses_count} avg -${abs(avg_settled_loss):.2f}",
         f"📊 Win rate: {win_rate:.1f}%",
         f"💰 Total PnL: {total_pnl_str}",

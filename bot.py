@@ -2213,24 +2213,18 @@ def build_telegram_dashboard() -> str:
         ORDER BY entry_price ASC
     """, (current_run_id,)).fetchall()
 
-    sell_target_wins = conn.execute("""
+    target_hits_count = conn.execute("""
         SELECT COUNT(*)
         FROM trades
         WHERE exit_reason = 'SELL_TARGET' AND exit_price IS NOT NULL
           AND run_id = ? AND paper = 0
     """, (current_run_id,)).fetchone()[0]
 
-    settled_wins = conn.execute("""
+    settled_losses_count = conn.execute("""
         SELECT COUNT(*)
         FROM trades
-        WHERE exit_reason = 'SETTLED_WIN' AND exit_price IS NOT NULL
-          AND run_id = ? AND paper = 0
-    """, (current_run_id,)).fetchone()[0]
-
-    settled_losses = conn.execute("""
-        SELECT COUNT(*)
-        FROM trades
-        WHERE exit_reason = 'SETTLED_LOSS' AND exit_price IS NOT NULL
+        WHERE exit_price = 0.0
+          AND exit_reason IN ('SETTLED_LOSS', 'RECONCILED_SETTLEMENT')
           AND run_id = ? AND paper = 0
     """, (current_run_id,)).fetchone()[0]
 
@@ -2243,23 +2237,15 @@ def build_telegram_dashboard() -> str:
         WHERE exit_reason = 'SELL_TARGET' AND run_id = ? AND paper = 0
     """, (current_run_id,)).fetchone()[0] or 0.0
 
-    avg_settled_win_pnl = conn.execute("""
+    avg_settled_loss = conn.execute("""
         SELECT COALESCE(
             AVG((exit_price - entry_price) * volume - entry_fee - COALESCE(exit_fee, 0.0)),
             0.0
         )
         FROM trades
-        WHERE exit_reason = 'SETTLED_WIN' AND run_id = ? AND paper = 0
-    """, (current_run_id,)).fetchone()[0] or 0.0
-
-    avg_settled_loss_pnl = conn.execute("""
-        SELECT COALESCE(
-            AVG((exit_price - entry_price) * volume - entry_fee - COALESCE(exit_fee, 0.0)),
-            0.0
-        )
-        FROM trades
-        WHERE exit_reason IN ('SETTLED_LOSS', 'RECONCILED_SETTLEMENT')
-          AND exit_price = 0.0 AND run_id = ? AND paper = 0
+        WHERE exit_price = 0.0
+          AND exit_reason IN ('SETTLED_LOSS', 'RECONCILED_SETTLEMENT')
+          AND run_id = ? AND paper = 0
     """, (current_run_id,)).fetchone()[0] or 0.0
 
     total_pnl = conn.execute("""
@@ -2276,14 +2262,16 @@ def build_telegram_dashboard() -> str:
 
     now = datetime.now(tz=EASTERN)
     total_pnl_str = f"+${total_pnl:.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):.2f}"
+    total_closed = target_hits_count + settled_losses_count
+    win_rate = (target_hits_count / total_closed * 100) if total_closed > 0 else 0.0
 
     lines = [
         f"📊 *Dip Bot* | Run #{current_run_id} | {now.strftime('%Y-%m-%d')} {now.strftime('%H:%M')} ET",
         "",
         f"💼 Open: {len(open_rows)}",
-        f"🎯 Target hits: {sell_target_wins} avg +${avg_target_hit_pnl:.2f}",
-        f"✅ Settled wins: {settled_wins} avg +${avg_settled_win_pnl:.2f}",
-        f"❌ Settled losses: {settled_losses} avg -${abs(avg_settled_loss_pnl):.2f}",
+        f"🎯 Target hits: {target_hits_count} avg +${avg_target_hit_pnl:.2f}",
+        f"❌ Settled losses: {settled_losses_count} avg -${abs(avg_settled_loss):.2f}",
+        f"📊 Win rate: {win_rate:.1f}%",
         f"💰 Total PnL: {total_pnl_str}",
         "",
         "*Recent open positions:*",

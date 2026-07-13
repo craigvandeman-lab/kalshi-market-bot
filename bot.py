@@ -2415,12 +2415,14 @@ def switch_to_convergence_target(temp_type: str) -> None:
 
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute("""
-        SELECT id, market_ticker, series_ticker, bracket_label,
-               entry_price, volume, sell_order_id, entry_fee
-        FROM trades
-        WHERE exit_price IS NULL AND paper = 0 AND run_id = ?
-          AND sell_target != ?
-          AND (CASE WHEN series_ticker LIKE '%HIGH%' THEN 'HIGH' ELSE 'LOW' END) = ?
+        SELECT t.id, t.market_ticker, t.series_ticker, t.bracket_label,
+               t.entry_price, t.volume, t.sell_order_id, t.entry_fee
+        FROM trades t
+        JOIN watchlist w ON w.bracket_ticker = t.market_ticker
+        WHERE t.exit_price IS NULL AND t.paper = 0 AND t.run_id = ?
+          AND t.sell_target != ?
+          AND date(w.occurrence_dt) = date('now')
+          AND (CASE WHEN t.series_ticker LIKE '%HIGH%' THEN 'HIGH' ELSE 'LOW' END) = ?
     """, (current_run_id, CONVERGENCE_TARGET, temp_type)).fetchall()
     conn.close()
 

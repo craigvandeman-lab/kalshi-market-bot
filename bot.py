@@ -603,6 +603,28 @@ def get_sell_target(entry_price: float) -> float:
     return TARGET_TIER_6
 
 
+def is_convergence_active(series_ticker: str, market_ticker: str) -> bool:
+    temp_type = "HIGH" if "HIGH" in series_ticker else "LOW"
+    now = datetime.now(tz=UTC)
+    if temp_type == "HIGH" and now.hour >= HIGH_CONVERGENCE_UTC:
+        return True
+    if temp_type == "LOW" and now.hour >= LOW_CONVERGENCE_UTC:
+        return True
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        row = conn.execute("""
+            SELECT 1 FROM trades
+            WHERE market_ticker = ? AND run_id = ? AND sell_target = ?
+            LIMIT 1
+        """, (market_ticker, current_run_id, CONVERGENCE_TARGET)).fetchone()
+        conn.close()
+        if row:
+            return True
+    except Exception as e:
+        log.debug(f"is_convergence_active DB check failed for {market_ticker}: {e}")
+    return False
+
+
 def calc_taker_fee(price: float, contracts: int) -> float:
     return 0.07 * price * (1 - price) * contracts
 
@@ -773,6 +795,13 @@ def place_trade(
 
     if PAPER_TRADING:
         sell_target = get_sell_target(yes_ask)
+        if is_convergence_active(series_ticker, ticker):
+            original_target = sell_target
+            sell_target = CONVERGENCE_TARGET
+            log.info(
+                f"Convergence active for {ticker} — using target "
+                f"${CONVERGENCE_TARGET:.2f} instead of ${original_target:.2f}"
+            )
         order_id = f"PAPER-{int(time.time())}"
         log.info(
             f"[PAPER] BUY {series_ticker} {bracket_label} @ {yes_ask:.2f} "
@@ -841,10 +870,14 @@ def place_trade(
             projected_blended_entry = (
                 (existing_cost_basis + (contracts_to_buy * yes_ask)) / new_total_contracts
             )
-            if existing_rows[0][5] == CONVERGENCE_TARGET:
+            new_sell_target = get_sell_target(projected_blended_entry)
+            if is_convergence_active(series_ticker, ticker):
+                original_target = new_sell_target
                 new_sell_target = CONVERGENCE_TARGET
-            else:
-                new_sell_target = get_sell_target(projected_blended_entry)
+                log.info(
+                    f"Convergence active for {ticker} — using target "
+                    f"${CONVERGENCE_TARGET:.2f} instead of ${original_target:.2f}"
+                )
             buy_depth = get_yes_buy_depth(ticker, new_sell_target)
             if buy_depth < new_total_contracts:
                 log.info(
@@ -886,10 +919,14 @@ def place_trade(
             new_blended_entry = (
                 (existing_cost_basis + (filled_qty * actual_fill_price)) / new_total_contracts
             )
-            if existing_rows[0][5] == CONVERGENCE_TARGET:
+            new_sell_target = get_sell_target(new_blended_entry)
+            if is_convergence_active(series_ticker, ticker):
+                original_target = new_sell_target
                 new_sell_target = CONVERGENCE_TARGET
-            else:
-                new_sell_target = get_sell_target(new_blended_entry)
+                log.info(
+                    f"Convergence active for {ticker} — using target "
+                    f"${CONVERGENCE_TARGET:.2f} instead of ${original_target:.2f}"
+                )
 
             for row in existing_rows:
                 prior_sell_id = row[3]
@@ -920,6 +957,13 @@ def place_trade(
             )
         else:
             sell_target = get_sell_target(actual_fill_price)
+            if is_convergence_active(series_ticker, ticker):
+                original_target = sell_target
+                sell_target = CONVERGENCE_TARGET
+                log.info(
+                    f"Convergence active for {ticker} — using target "
+                    f"${CONVERGENCE_TARGET:.2f} instead of ${original_target:.2f}"
+                )
             sell_resp = kalshi_post("/portfolio/events/orders", {
                 "ticker":                     ticker,
                 "client_order_id":            str(uuid.uuid4()),

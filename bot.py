@@ -671,7 +671,7 @@ def fetch_wallet_balance() -> float | None:
 def get_trade_amount_cents(market_open_time: str | None = None) -> int:
     now = datetime.now(tz=UTC)
     if not market_open_time:
-        log.warning("get_trade_amount_cents: no market open_time, falling back to 14:00 UTC anchor")
+        log.debug("get_trade_amount_cents: no market open_time, falling back to 14:00 UTC anchor")
         market_open_today = now.replace(hour=14, minute=0, second=0, microsecond=0)
         if now < market_open_today:
             market_open_today -= timedelta(days=1)

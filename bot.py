@@ -80,6 +80,10 @@ LOW_CUTOFF_LOCAL_HOUR = int(os.getenv("LOW_CUTOFF_LOCAL_HOUR", "9"))
 LOW_CUTOFF_PACIFIC_UTC = int(os.getenv("LOW_CUTOFF_PACIFIC_UTC", "20"))
 HIGH_CUTOFF_LOCAL_HOUR = int(os.getenv("HIGH_CUTOFF_LOCAL_HOUR", "16"))
 HIGH_CUTOFF_PACIFIC_UTC = int(os.getenv("HIGH_CUTOFF_PACIFIC_UTC", "23"))
+HIGH_CONVERGENCE_UTC = int(os.getenv("HIGH_CONVERGENCE_UTC", "21"))
+LOW_CONVERGENCE_UTC  = int(os.getenv("LOW_CONVERGENCE_UTC", "3"))
+CONVERGENCE_MIN_SIZE = int(os.getenv("CONVERGENCE_MIN_SIZE", "200"))
+CONVERGENCE_TARGET   = float(os.getenv("CONVERGENCE_TARGET", "0.93"))
 
 EASTERN = ZoneInfo("America/New_York")
 UTC     = ZoneInfo("UTC")
@@ -754,14 +758,22 @@ def should_top_up(ticker: str, open_time: str | None = None) -> tuple[bool, floa
         SELECT entry_price, volume FROM trades
         WHERE market_ticker = ? AND exit_price IS NULL AND run_id = ?
     """, (ticker, current_run_id)).fetchall()
+    sell_target_row = conn.execute("""
+        SELECT sell_target FROM trades
+        WHERE market_ticker = ? AND exit_price IS NULL AND run_id = ?
+        LIMIT 1
+    """, (ticker, current_run_id)).fetchone()
     conn.close()
 
     existing_cost_basis = sum(
         (entry_price or 0) * (float(volume) if volume else 0)
         for entry_price, volume in rows
     )
-    target_position_size = get_trade_amount_cents(open_time) / 100
-    remaining_budget = target_position_size - existing_cost_basis
+    if sell_target_row and sell_target_row[0] == CONVERGENCE_TARGET:
+        target_size = CONVERGENCE_MIN_SIZE / 100
+    else:
+        target_size = get_trade_amount_cents(open_time) / 100
+    remaining_budget = target_size - existing_cost_basis
     if remaining_budget < 0.50:
         return (False, 0.0)
     return (True, remaining_budget)
@@ -840,7 +852,7 @@ def place_trade(
 
         conn = sqlite3.connect(DB_PATH)
         existing_rows = conn.execute("""
-            SELECT id, entry_price, volume, sell_order_id, entry_fee
+            SELECT id, entry_price, volume, sell_order_id, entry_fee, sell_target
             FROM trades
             WHERE market_ticker = ? AND exit_price IS NULL AND run_id = ?
             ORDER BY id DESC
@@ -859,7 +871,10 @@ def place_trade(
             projected_blended_entry = (
                 (existing_cost_basis + (contracts_to_buy * yes_ask)) / new_total_contracts
             )
-            new_sell_target = get_sell_target(projected_blended_entry)
+            if existing_rows[0][5] == CONVERGENCE_TARGET:
+                new_sell_target = CONVERGENCE_TARGET
+            else:
+                new_sell_target = get_sell_target(projected_blended_entry)
             buy_depth = get_yes_buy_depth(ticker, new_sell_target)
             if buy_depth < new_total_contracts:
                 log.info(
@@ -901,7 +916,10 @@ def place_trade(
             new_blended_entry = (
                 (existing_cost_basis + (filled_qty * actual_fill_price)) / new_total_contracts
             )
-            new_sell_target = get_sell_target(new_blended_entry)
+            if existing_rows[0][5] == CONVERGENCE_TARGET:
+                new_sell_target = CONVERGENCE_TARGET
+            else:
+                new_sell_target = get_sell_target(new_blended_entry)
 
             for row in existing_rows:
                 prior_sell_id = row[3]
@@ -2391,6 +2409,98 @@ def _scheduled_build_watchlist():
     watchlist_is_valid = True
 
 
+def switch_to_convergence_target(temp_type: str) -> None:
+    if PAPER_TRADING:
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute("""
+        SELECT id, market_ticker, series_ticker, bracket_label,
+               entry_price, volume, sell_order_id, entry_fee
+        FROM trades
+        WHERE exit_price IS NULL AND paper = 0 AND run_id = ?
+          AND sell_target != ?
+          AND (CASE WHEN series_ticker LIKE '%HIGH%' THEN 'HIGH' ELSE 'LOW' END) = ?
+    """, (current_run_id, CONVERGENCE_TARGET, temp_type)).fetchall()
+    conn.close()
+
+    switched = 0
+    failures = 0
+    for (
+        trade_id, market_ticker, series_ticker, bracket_label,
+        entry_price, volume, sell_order_id, entry_fee,
+    ) in rows:
+        if sell_order_id:
+            try:
+                cancel_order(sell_order_id)
+            except Exception as e:
+                log.warning(
+                    f"Convergence cancel failed for {market_ticker} "
+                    f"order {sell_order_id}: {e}"
+                )
+
+        contracts = float(volume) if volume else 0.0
+        if contracts <= 0:
+            log.warning(f"Convergence skip {market_ticker}: no volume")
+            failures += 1
+            time.sleep(0.25)
+            continue
+
+        try:
+            sell_resp = kalshi_post("/portfolio/events/orders", {
+                "ticker":                     market_ticker,
+                "client_order_id":            str(uuid.uuid4()),
+                "side":                       "ask",
+                "count":                      f"{contracts:.2f}",
+                "price":                      f"{CONVERGENCE_TARGET:.4f}",
+                "time_in_force":              "good_till_canceled",
+                "self_trade_prevention_type": "taker_at_cross",
+            })
+            new_order_id = sell_resp.get("order_id", "UNKNOWN")
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute("""
+                UPDATE trades
+                SET sell_target = ?, sell_order_id = ?, last_known_fill_count = 0
+                WHERE id = ?
+            """, (CONVERGENCE_TARGET, new_order_id, trade_id))
+            conn.commit()
+            conn.close()
+            if market_ticker in open_positions:
+                open_positions[market_ticker]["target"] = CONVERGENCE_TARGET
+            switched += 1
+            log.info(
+                f"Convergence switch [{temp_type}] {series_ticker} {bracket_label} "
+                f"{market_ticker}: qty {contracts:.0f} → ${CONVERGENCE_TARGET:.2f} "
+                f"order {new_order_id}"
+            )
+        except Exception as e:
+            failures += 1
+            log.error(f"Convergence switch failed for {market_ticker}: {e}")
+
+        time.sleep(0.25)
+
+    log.info(
+        f"Convergence switch [{temp_type}] complete: switched={switched} failures={failures}"
+    )
+    if switched > 0:
+        send_telegram(
+            f"🎯 Convergence switch [{temp_type}]: {switched} sell orders → "
+            f"${CONVERGENCE_TARGET:.2f}"
+        )
+
+
+def _scheduled_high_convergence():
+    now = datetime.now(tz=UTC)
+    if now.hour == HIGH_CONVERGENCE_UTC:
+        switch_to_convergence_target("HIGH")
+
+
+def _scheduled_low_convergence():
+    now = datetime.now(tz=UTC)
+    if now.hour == LOW_CONVERGENCE_UTC:
+        switch_to_convergence_target("LOW")
+
+
 def _retry_watchlist_build():
     schedule.clear("watchlist_retry")
     if not try_build_watchlist():
@@ -2430,7 +2540,11 @@ def main():
         f"LOW_CUTOFF_LOCAL_HOUR={LOW_CUTOFF_LOCAL_HOUR} "
         f"LOW_CUTOFF_PACIFIC_UTC={LOW_CUTOFF_PACIFIC_UTC} "
         f"HIGH_CUTOFF_LOCAL_HOUR={HIGH_CUTOFF_LOCAL_HOUR} "
-        f"HIGH_CUTOFF_PACIFIC_UTC={HIGH_CUTOFF_PACIFIC_UTC}"
+        f"HIGH_CUTOFF_PACIFIC_UTC={HIGH_CUTOFF_PACIFIC_UTC} "
+        f"HIGH_CONVERGENCE_UTC={HIGH_CONVERGENCE_UTC} "
+        f"LOW_CONVERGENCE_UTC={LOW_CONVERGENCE_UTC} "
+        f"CONVERGENCE_MIN_SIZE={CONVERGENCE_MIN_SIZE} "
+        f"CONVERGENCE_TARGET={CONVERGENCE_TARGET}"
     )
     disabled = sorted(s for s, c in SERIES_CONFIG.items() if not c.get("enabled", True))
     if ENABLED_SERIES:
@@ -2491,12 +2605,16 @@ def main():
     schedule.every(SCAN_INTERVAL_MINUTES).minutes.do(_scheduled_watchlist_monitor)
     schedule.every(SCAN_INTERVAL_MINUTES).minutes.do(check_fills)
     schedule.every(SCAN_INTERVAL_MINUTES).minutes.do(run_price_history_capture)
+    schedule.every(30).minutes.do(_scheduled_high_convergence)
+    schedule.every(30).minutes.do(_scheduled_low_convergence)
     schedule.every(10).minutes.do(check_health)
     schedule.every().day.at("12:00").do(send_daily_summary)
     schedule.every(5).seconds.do(handle_telegram_commands)
     log.info(
         f"Scheduled: watchlist build daily 14:05 UTC; monitor + fills + price history "
         f"every {SCAN_INTERVAL_MINUTES} min; "
+        f"HIGH convergence @ {HIGH_CONVERGENCE_UTC}:00 UTC, "
+        f"LOW convergence @ {LOW_CONVERGENCE_UTC}:00 UTC (checked every 30 min); "
         "health check every 10 min; daily summary 12:00 UTC; Telegram every 5s"
     )
 

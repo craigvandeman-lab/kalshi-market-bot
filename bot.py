@@ -76,10 +76,6 @@ MIN_WALLET_BALANCE = float(os.getenv("MIN_WALLET_BALANCE", "50.00"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "999"))
 ENABLED_SERIES     = os.getenv("ENABLED_SERIES", "")
 SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "2"))
-LOW_CUTOFF_LOCAL_HOUR = int(os.getenv("LOW_CUTOFF_LOCAL_HOUR", "9"))
-LOW_CUTOFF_PACIFIC_UTC = int(os.getenv("LOW_CUTOFF_PACIFIC_UTC", "20"))
-HIGH_CUTOFF_LOCAL_HOUR = int(os.getenv("HIGH_CUTOFF_LOCAL_HOUR", "16"))
-HIGH_CUTOFF_PACIFIC_UTC = int(os.getenv("HIGH_CUTOFF_PACIFIC_UTC", "23"))
 HIGH_CONVERGENCE_UTC = int(os.getenv("HIGH_CONVERGENCE_UTC", "21"))
 LOW_CONVERGENCE_UTC  = int(os.getenv("LOW_CONVERGENCE_UTC", "3"))
 CONVERGENCE_MIN_SIZE = int(os.getenv("CONVERGENCE_MIN_SIZE", "200"))
@@ -422,27 +418,6 @@ def is_within_cutoff(occurrence_dt: datetime) -> bool:
     return datetime.now(tz=UTC) >= occurrence_dt - timedelta(hours=1)
 
 
-def is_temp_cutoff(series_ticker: str) -> bool:
-    temp_type = "HIGH" if "HIGH" in series_ticker else "LOW"
-    cfg = SERIES_CONFIG.get(series_ticker, {})
-    tz_str = cfg.get("timezone", "America/New_York")
-    if temp_type == "HIGH":
-        if tz_str == "America/Los_Angeles":
-            active = datetime.now(tz=UTC).hour >= HIGH_CUTOFF_PACIFIC_UTC
-        else:
-            local_time = datetime.now(tz=UTC).astimezone(ZoneInfo(tz_str))
-            active = local_time.hour >= HIGH_CUTOFF_LOCAL_HOUR
-    else:
-        if tz_str == "America/Los_Angeles":
-            active = datetime.now(tz=UTC).hour >= LOW_CUTOFF_PACIFIC_UTC
-        else:
-            local_time = datetime.now(tz=UTC).astimezone(ZoneInfo(tz_str))
-            active = local_time.hour >= LOW_CUTOFF_LOCAL_HOUR
-    if active:
-        log.debug(f"{temp_type} cutoff active for {series_ticker} ({tz_str})")
-    return active
-
-
 def is_open_snapshot_window() -> bool:
     now = datetime.now(tz=UTC)
     return now.hour == 14 and 5 <= now.minute < 15
@@ -746,11 +721,6 @@ def should_top_up(ticker: str, open_time: str | None = None) -> tuple[bool, floa
         log.debug(
             f"Top-up blocked for {ticker} — within cutoff of occurrence {occurrence_dt}"
         )
-        return (False, 0.0)
-
-    series_ticker = parse_series_from_ticker(ticker)
-    if not PAPER_TRADING and is_temp_cutoff(series_ticker):
-        log.debug(f"Top-up blocked for {ticker} — temp cutoff reached")
         return (False, 0.0)
 
     conn = sqlite3.connect(DB_PATH)
@@ -1197,13 +1167,6 @@ def run_watchlist_monitor() -> None:
             log.info(
                 f"{series_ticker} | {event_date} | all — skipping, "
                 f"within 1h cutoff (occurrence={occurrence_dt})"
-            )
-            continue
-
-        if not PAPER_TRADING and is_temp_cutoff(series_ticker):
-            event_date = info.get("event_date", "—")
-            log.debug(
-                f"{series_ticker} | {event_date} | skipping — temp cutoff reached"
             )
             continue
 
@@ -2539,10 +2502,6 @@ def main():
         f"TRADE_AMOUNT_CENTS_EARLY={TRADE_AMOUNT_CENTS_EARLY} "
         f"TRADE_AMOUNT_CENTS_LATE={TRADE_AMOUNT_CENTS_LATE} "
         f"EARLY_PHASE_HOURS={EARLY_PHASE_HOURS} "
-        f"LOW_CUTOFF_LOCAL_HOUR={LOW_CUTOFF_LOCAL_HOUR} "
-        f"LOW_CUTOFF_PACIFIC_UTC={LOW_CUTOFF_PACIFIC_UTC} "
-        f"HIGH_CUTOFF_LOCAL_HOUR={HIGH_CUTOFF_LOCAL_HOUR} "
-        f"HIGH_CUTOFF_PACIFIC_UTC={HIGH_CUTOFF_PACIFIC_UTC} "
         f"HIGH_CONVERGENCE_UTC={HIGH_CONVERGENCE_UTC} "
         f"LOW_CONVERGENCE_UTC={LOW_CONVERGENCE_UTC} "
         f"CONVERGENCE_MIN_SIZE={CONVERGENCE_MIN_SIZE} "

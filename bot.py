@@ -76,8 +76,11 @@ MIN_WALLET_BALANCE = float(os.getenv("MIN_WALLET_BALANCE", "50.00"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "999"))
 ENABLED_SERIES     = os.getenv("ENABLED_SERIES", "")
 SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "2"))
-HIGH_CONVERGENCE_UTC = int(os.getenv("HIGH_CONVERGENCE_UTC", "21"))
-LOW_CONVERGENCE_UTC  = int(os.getenv("LOW_CONVERGENCE_UTC", "3"))
+LOW_CONVERGENCE_LOCAL_HOUR_ET  = int(os.getenv("LOW_CONVERGENCE_LOCAL_HOUR_ET", "6"))
+LOW_CONVERGENCE_LOCAL_HOUR_CT  = int(os.getenv("LOW_CONVERGENCE_LOCAL_HOUR_CT", "6"))
+LOW_CONVERGENCE_LOCAL_HOUR_MT  = int(os.getenv("LOW_CONVERGENCE_LOCAL_HOUR_MT", "6"))
+LOW_CONVERGENCE_LOCAL_HOUR_PT  = int(os.getenv("LOW_CONVERGENCE_LOCAL_HOUR_PT", "14"))
+HIGH_CONVERGENCE_LOCAL_HOUR    = int(os.getenv("HIGH_CONVERGENCE_LOCAL_HOUR", "19"))
 CONVERGENCE_MIN_SIZE = int(os.getenv("CONVERGENCE_MIN_SIZE", "200"))
 CONVERGENCE_TARGET   = float(os.getenv("CONVERGENCE_TARGET", "0.93"))
 
@@ -603,12 +606,26 @@ def get_sell_target(entry_price: float) -> float:
     return TARGET_TIER_6
 
 
-def is_convergence_active(series_ticker: str, market_ticker: str) -> bool:
+def get_convergence_hour(series_ticker: str) -> int:
     temp_type = "HIGH" if "HIGH" in series_ticker else "LOW"
-    now = datetime.now(tz=UTC)
-    if temp_type == "HIGH" and now.hour >= HIGH_CONVERGENCE_UTC:
-        return True
-    if temp_type == "LOW" and now.hour >= LOW_CONVERGENCE_UTC:
+    if temp_type == "HIGH":
+        return HIGH_CONVERGENCE_LOCAL_HOUR
+    tz_str = SERIES_CONFIG.get(series_ticker, {}).get("timezone", "America/New_York")
+    if tz_str == "America/New_York":
+        return LOW_CONVERGENCE_LOCAL_HOUR_ET
+    if tz_str == "America/Chicago":
+        return LOW_CONVERGENCE_LOCAL_HOUR_CT
+    if tz_str in ("America/Denver", "America/Phoenix"):
+        return LOW_CONVERGENCE_LOCAL_HOUR_MT
+    if tz_str == "America/Los_Angeles":
+        return LOW_CONVERGENCE_LOCAL_HOUR_PT
+    return LOW_CONVERGENCE_LOCAL_HOUR_ET
+
+
+def is_convergence_active(series_ticker: str, market_ticker: str) -> bool:
+    tz_str = SERIES_CONFIG.get(series_ticker, {}).get("timezone", "America/New_York")
+    local_hour = datetime.now(tz=UTC).astimezone(ZoneInfo(tz_str)).hour
+    if local_hour >= get_convergence_hour(series_ticker):
         return True
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -2416,7 +2433,7 @@ def _scheduled_build_watchlist():
     watchlist_is_valid = True
 
 
-def switch_to_convergence_target(temp_type: str) -> None:
+def switch_convergence_if_needed() -> None:
     if PAPER_TRADING:
         return
 
@@ -2429,16 +2446,21 @@ def switch_to_convergence_target(temp_type: str) -> None:
         WHERE t.exit_price IS NULL AND t.paper = 0 AND t.run_id = ?
           AND t.sell_target != ?
           AND date(w.occurrence_dt) = date('now')
-          AND (CASE WHEN t.series_ticker LIKE '%HIGH%' THEN 'HIGH' ELSE 'LOW' END) = ?
-    """, (current_run_id, CONVERGENCE_TARGET, temp_type)).fetchall()
+    """, (current_run_id, CONVERGENCE_TARGET)).fetchall()
     conn.close()
 
-    switched = 0
+    high_count = 0
+    low_count = 0
     failures = 0
     for (
         trade_id, market_ticker, series_ticker, bracket_label,
         entry_price, volume, sell_order_id, entry_fee,
     ) in rows:
+        if not is_convergence_active(series_ticker, market_ticker):
+            continue
+
+        temp_type = "HIGH" if "HIGH" in series_ticker else "LOW"
+
         if sell_order_id:
             try:
                 cancel_order(sell_order_id)
@@ -2476,7 +2498,10 @@ def switch_to_convergence_target(temp_type: str) -> None:
             conn.close()
             if market_ticker in open_positions:
                 open_positions[market_ticker]["target"] = CONVERGENCE_TARGET
-            switched += 1
+            if temp_type == "HIGH":
+                high_count += 1
+            else:
+                low_count += 1
             log.info(
                 f"Convergence switch [{temp_type}] {series_ticker} {bracket_label} "
                 f"{market_ticker}: qty {contracts:.0f} → ${CONVERGENCE_TARGET:.2f} "
@@ -2488,26 +2513,20 @@ def switch_to_convergence_target(temp_type: str) -> None:
 
         time.sleep(0.25)
 
+    switched = high_count + low_count
     log.info(
-        f"Convergence switch [{temp_type}] complete: switched={switched} failures={failures}"
+        f"Convergence check complete: switched={switched} "
+        f"(HIGH={high_count}, LOW={low_count}) failures={failures}"
     )
     if switched > 0:
         send_telegram(
-            f"🎯 Convergence switch [{temp_type}]: {switched} sell orders → "
+            f"🎯 Convergence switch: {high_count} HIGH, {low_count} LOW orders → "
             f"${CONVERGENCE_TARGET:.2f}"
         )
 
 
-def _scheduled_high_convergence():
-    now = datetime.now(tz=UTC)
-    if now.hour == HIGH_CONVERGENCE_UTC:
-        switch_to_convergence_target("HIGH")
-
-
-def _scheduled_low_convergence():
-    now = datetime.now(tz=UTC)
-    if now.hour == LOW_CONVERGENCE_UTC:
-        switch_to_convergence_target("LOW")
+def _scheduled_convergence_check():
+    switch_convergence_if_needed()
 
 
 def _retry_watchlist_build():
@@ -2546,8 +2565,11 @@ def main():
         f"TRADE_AMOUNT_CENTS_EARLY={TRADE_AMOUNT_CENTS_EARLY} "
         f"TRADE_AMOUNT_CENTS_LATE={TRADE_AMOUNT_CENTS_LATE} "
         f"EARLY_PHASE_HOURS={EARLY_PHASE_HOURS} "
-        f"HIGH_CONVERGENCE_UTC={HIGH_CONVERGENCE_UTC} "
-        f"LOW_CONVERGENCE_UTC={LOW_CONVERGENCE_UTC} "
+        f"LOW_CONVERGENCE_LOCAL_HOUR_ET={LOW_CONVERGENCE_LOCAL_HOUR_ET} "
+        f"LOW_CONVERGENCE_LOCAL_HOUR_CT={LOW_CONVERGENCE_LOCAL_HOUR_CT} "
+        f"LOW_CONVERGENCE_LOCAL_HOUR_MT={LOW_CONVERGENCE_LOCAL_HOUR_MT} "
+        f"LOW_CONVERGENCE_LOCAL_HOUR_PT={LOW_CONVERGENCE_LOCAL_HOUR_PT} "
+        f"HIGH_CONVERGENCE_LOCAL_HOUR={HIGH_CONVERGENCE_LOCAL_HOUR} "
         f"CONVERGENCE_MIN_SIZE={CONVERGENCE_MIN_SIZE} "
         f"CONVERGENCE_TARGET={CONVERGENCE_TARGET}"
     )
@@ -2610,53 +2632,17 @@ def main():
     schedule.every(SCAN_INTERVAL_MINUTES).minutes.do(_scheduled_watchlist_monitor)
     schedule.every(SCAN_INTERVAL_MINUTES).minutes.do(check_fills)
     schedule.every(SCAN_INTERVAL_MINUTES).minutes.do(run_price_history_capture)
-    schedule.every(30).minutes.do(_scheduled_high_convergence)
-    schedule.every(30).minutes.do(_scheduled_low_convergence)
+    schedule.every(SCAN_INTERVAL_MINUTES).minutes.do(_scheduled_convergence_check)
     schedule.every(10).minutes.do(check_health)
     schedule.every().day.at("12:00").do(send_daily_summary)
     schedule.every(5).seconds.do(handle_telegram_commands)
     log.info(
         f"Scheduled: watchlist build daily 14:05 UTC; monitor + fills + price history "
-        f"every {SCAN_INTERVAL_MINUTES} min; "
-        f"HIGH convergence @ {HIGH_CONVERGENCE_UTC}:00 UTC, "
-        f"LOW convergence @ {LOW_CONVERGENCE_UTC}:00 UTC (checked every 30 min); "
+        f"+ convergence check every {SCAN_INTERVAL_MINUTES} min; "
         "health check every 10 min; daily summary 12:00 UTC; Telegram every 5s"
     )
 
-    now = datetime.now(tz=UTC)
-    if now.hour > LOW_CONVERGENCE_UTC or (now.hour == LOW_CONVERGENCE_UTC and now.minute > 0):
-        conn = sqlite3.connect(DB_PATH)
-        pending = conn.execute("""
-            SELECT COUNT(*) FROM trades t
-            JOIN watchlist w ON w.bracket_ticker = t.market_ticker
-            WHERE t.exit_price IS NULL AND t.paper = 0 AND t.run_id = ?
-            AND t.sell_target != ?
-            AND date(w.occurrence_dt) = date('now')
-            AND t.series_ticker NOT LIKE '%HIGH%'
-        """, (current_run_id, CONVERGENCE_TARGET)).fetchone()[0]
-        conn.close()
-        if pending > 0:
-            log.info(
-                f"Startup: missed LOW convergence window, running switch now ({pending} positions)"
-            )
-            switch_to_convergence_target("LOW")
-
-    if now.hour > HIGH_CONVERGENCE_UTC or (now.hour == HIGH_CONVERGENCE_UTC and now.minute > 0):
-        conn = sqlite3.connect(DB_PATH)
-        pending = conn.execute("""
-            SELECT COUNT(*) FROM trades t
-            JOIN watchlist w ON w.bracket_ticker = t.market_ticker
-            WHERE t.exit_price IS NULL AND t.paper = 0 AND t.run_id = ?
-            AND t.sell_target != ?
-            AND date(w.occurrence_dt) = date('now')
-            AND t.series_ticker LIKE '%HIGH%'
-        """, (current_run_id, CONVERGENCE_TARGET)).fetchone()[0]
-        conn.close()
-        if pending > 0:
-            log.info(
-                f"Startup: missed HIGH convergence window, running switch now ({pending} positions)"
-            )
-            switch_to_convergence_target("HIGH")
+    switch_convergence_if_needed()
 
     try:
         while True:

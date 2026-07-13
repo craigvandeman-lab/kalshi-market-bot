@@ -2620,6 +2620,41 @@ def main():
         "health check every 10 min; daily summary 12:00 UTC; Telegram every 5s"
     )
 
+    now = datetime.now(tz=UTC)
+    if now.hour > LOW_CONVERGENCE_UTC or (now.hour == LOW_CONVERGENCE_UTC and now.minute > 0):
+        conn = sqlite3.connect(DB_PATH)
+        pending = conn.execute("""
+            SELECT COUNT(*) FROM trades t
+            JOIN watchlist w ON w.bracket_ticker = t.market_ticker
+            WHERE t.exit_price IS NULL AND t.paper = 0 AND t.run_id = ?
+            AND t.sell_target != ?
+            AND date(w.occurrence_dt) = date('now')
+            AND t.series_ticker NOT LIKE '%HIGH%'
+        """, (current_run_id, CONVERGENCE_TARGET)).fetchone()[0]
+        conn.close()
+        if pending > 0:
+            log.info(
+                f"Startup: missed LOW convergence window, running switch now ({pending} positions)"
+            )
+            switch_to_convergence_target("LOW")
+
+    if now.hour > HIGH_CONVERGENCE_UTC or (now.hour == HIGH_CONVERGENCE_UTC and now.minute > 0):
+        conn = sqlite3.connect(DB_PATH)
+        pending = conn.execute("""
+            SELECT COUNT(*) FROM trades t
+            JOIN watchlist w ON w.bracket_ticker = t.market_ticker
+            WHERE t.exit_price IS NULL AND t.paper = 0 AND t.run_id = ?
+            AND t.sell_target != ?
+            AND date(w.occurrence_dt) = date('now')
+            AND t.series_ticker LIKE '%HIGH%'
+        """, (current_run_id, CONVERGENCE_TARGET)).fetchone()[0]
+        conn.close()
+        if pending > 0:
+            log.info(
+                f"Startup: missed HIGH convergence window, running switch now ({pending} positions)"
+            )
+            switch_to_convergence_target("HIGH")
+
     try:
         while True:
             schedule.run_pending()

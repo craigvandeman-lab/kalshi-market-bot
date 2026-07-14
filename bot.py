@@ -623,9 +623,21 @@ def get_convergence_hour(series_ticker: str) -> int:
 
 
 def is_convergence_active(series_ticker: str, market_ticker: str) -> bool:
+    parts = market_ticker.split("-")
+    if len(parts) < 2:
+        return False
+    try:
+        event_dt = datetime.strptime(parts[1].upper(), "%y%b%d")
+    except ValueError:
+        return False
+
     tz_str = SERIES_CONFIG.get(series_ticker, {}).get("timezone", "America/New_York")
-    local_hour = datetime.now(tz=UTC).astimezone(ZoneInfo(tz_str)).hour
-    if local_hour >= get_convergence_hour(series_ticker):
+    local_now = datetime.now(tz=ZoneInfo(tz_str))
+    local_today = local_now.date()
+    if event_dt.date() != local_today:
+        return False
+
+    if local_now.hour >= get_convergence_hour(series_ticker):
         return True
     try:
         conn = sqlite3.connect(DB_PATH)

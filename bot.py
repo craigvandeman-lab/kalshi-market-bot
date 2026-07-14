@@ -83,6 +83,7 @@ LOW_CONVERGENCE_LOCAL_HOUR_PT  = int(os.getenv("LOW_CONVERGENCE_LOCAL_HOUR_PT", 
 HIGH_CONVERGENCE_LOCAL_HOUR    = int(os.getenv("HIGH_CONVERGENCE_LOCAL_HOUR", "19"))
 CONVERGENCE_MIN_SIZE = int(os.getenv("CONVERGENCE_MIN_SIZE", "200"))
 CONVERGENCE_TARGET   = float(os.getenv("CONVERGENCE_TARGET", "0.93"))
+TRADING_PAUSED = os.getenv("TRADING_PAUSED", "false").lower() == "true"
 
 EASTERN = ZoneInfo("America/New_York")
 UTC     = ZoneInfo("UTC")
@@ -112,6 +113,7 @@ current_run_id: int = 0
 watchlist_is_valid: bool = False
 cycle_spent: float = 0.0
 last_cycle_at: datetime | None = None
+trading_paused: bool = TRADING_PAUSED
 
 # vwap_cache: dict = {}
 # VWAP_CACHE_TTL_MINUTES = 15
@@ -1223,7 +1225,11 @@ def try_build_watchlist() -> bool:
 
 
 def run_watchlist_monitor() -> None:
-    global last_cycle_at
+    global last_cycle_at, trading_paused
+
+    if trading_paused:
+        log.info("Trading paused — skipping monitor cycle")
+        return
 
     if not watchlist_is_valid:
         return
@@ -2395,7 +2401,7 @@ def build_balance_report() -> str:
 
 
 def handle_telegram_commands() -> None:
-    global telegram_offset, current_run_id, open_positions
+    global telegram_offset, current_run_id, open_positions, trading_paused
     if not TELEGRAM_BOT_TOKEN:
         return
     try:
@@ -2423,6 +2429,22 @@ def handle_telegram_commands() -> None:
                 send_telegram(build_telegram_dashboard())
             elif text.startswith("/balance"):
                 send_telegram(build_balance_report())
+            elif text.startswith("/pause"):
+                trading_paused = True
+                send_telegram(
+                    "⏸️ Trading PAUSED\n"
+                    "New entries and top-ups are suspended.\n"
+                    "Monitoring, settlements, and sell order management continue.\n"
+                    "Send /resume to resume trading."
+                )
+                log.info("Trading paused via Telegram command")
+            elif text.startswith("/resume"):
+                trading_paused = False
+                send_telegram(
+                    "▶️ Trading RESUMED\n"
+                    "New entries and top-ups are active again."
+                )
+                log.info("Trading resumed via Telegram command")
     except Exception as e:
         log.warning(f"Telegram command polling error: {e}")
 
@@ -2583,7 +2605,8 @@ def main():
         f"LOW_CONVERGENCE_LOCAL_HOUR_PT={LOW_CONVERGENCE_LOCAL_HOUR_PT} "
         f"HIGH_CONVERGENCE_LOCAL_HOUR={HIGH_CONVERGENCE_LOCAL_HOUR} "
         f"CONVERGENCE_MIN_SIZE={CONVERGENCE_MIN_SIZE} "
-        f"CONVERGENCE_TARGET={CONVERGENCE_TARGET}"
+        f"CONVERGENCE_TARGET={CONVERGENCE_TARGET} "
+        f"TRADING_PAUSED={TRADING_PAUSED}"
     )
     disabled = sorted(s for s, c in SERIES_CONFIG.items() if not c.get("enabled", True))
     if ENABLED_SERIES:
@@ -2592,6 +2615,13 @@ def main():
         log.info("ENABLED_SERIES: all default series active")
     log.info(f"Disabled series: {', '.join(disabled) if disabled else '(none)'}")
     send_telegram(f"🤖 Kalshi Market Bot started | PAPER={PAPER_TRADING}")
+    if trading_paused:
+        send_telegram(
+            "⏸️ Bot started in PAUSED mode\n"
+            "New entries and top-ups are suspended.\n"
+            "Send /resume to begin trading."
+        )
+        log.info("Bot started with TRADING_PAUSED=true")
     handle_telegram_commands()
 
     watchlist = load_watchlist_from_db()

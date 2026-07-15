@@ -1229,6 +1229,7 @@ def run_watchlist_monitor() -> None:
 
     if trading_paused:
         log.info("Trading paused — skipping monitor cycle")
+        last_cycle_at = datetime.now(tz=UTC)
         return
 
     if not watchlist_is_valid:

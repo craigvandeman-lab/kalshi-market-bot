@@ -749,6 +749,9 @@ def place_trade(
             f"[PAPER] BUY {series_ticker} {bracket_label} @ {yes_ask:.2f} "
             f"| holding to settlement | qty {contracts}"
         )
+        price_2h, price_4h, price_6h = get_pre_entry_prices(
+            ticker, datetime.now(tz=UTC).isoformat()
+        )
         if record_trade({
             "series_ticker": series_ticker,
             "market_ticker": ticker,
@@ -764,6 +767,9 @@ def place_trade(
             "is_mean_bracket": 1 if is_mean_bracket else 0,
             "entry_fee":     entry_fee,
             "slippage":      slippage,
+            "price_2h_before_entry": price_2h,
+            "price_4h_before_entry": price_4h,
+            "price_6h_before_entry": price_6h,
         }):
             paper_balance -= TRADE_AMOUNT_CENTS / 100
         open_positions[ticker] = {
@@ -872,6 +878,9 @@ def place_trade(
         )
         return
 
+    price_2h, price_4h, price_6h = get_pre_entry_prices(
+        ticker, datetime.now(tz=UTC).isoformat()
+    )
     if record_trade({
         "series_ticker": series_ticker,
         "market_ticker": ticker,
@@ -888,6 +897,9 @@ def place_trade(
         "is_mean_bracket": 1 if is_mean_bracket else 0,
         "entry_fee":     incremental_entry_fee,
         "slippage":      slippage,
+        "price_2h_before_entry": price_2h,
+        "price_4h_before_entry": price_4h,
+        "price_6h_before_entry": price_6h,
     }):
         cycle_spent += trade_dollars
     open_positions[ticker] = {
@@ -1355,6 +1367,9 @@ def init_db():
         "slippage":        "REAL",
         "last_known_fill_count": "REAL",
         "realized_pnl":        "REAL",
+        "price_2h_before_entry": "REAL",
+        "price_4h_before_entry": "REAL",
+        "price_6h_before_entry": "REAL",
     }
     existing = {row[1] for row in conn.execute("PRAGMA table_info(trades)")}
     for col, col_type in expected_columns.items():
@@ -1547,6 +1562,26 @@ def get_or_create_run() -> int:
     return run_id
 
 
+def get_pre_entry_prices(
+    market_ticker: str, entry_time: str
+) -> tuple[float | None, float | None, float | None]:
+    conn = sqlite3.connect(DB_PATH)
+    prices: list[float | None] = []
+    for hours in (2, 4, 6):
+        row = conn.execute(
+            f"""
+            SELECT last_price FROM price_history
+            WHERE market_ticker = ?
+              AND observed_at <= datetime(?, '-{hours} hours')
+            ORDER BY observed_at DESC LIMIT 1
+            """,
+            (market_ticker, entry_time),
+        ).fetchone()
+        prices.append(row[0] if row else None)
+    conn.close()
+    return prices[0], prices[1], prices[2]
+
+
 def record_trade(trade: dict) -> int:
     conn = sqlite3.connect(DB_PATH)
     existing = conn.execute("""
@@ -1563,8 +1598,9 @@ def record_trade(trade: dict) -> int:
     cur = conn.execute("""
         INSERT INTO trades
             (series_ticker, market_ticker, bracket_label, side,
-             entry_price, sell_target, order_id, paper, volume, run_id, yes_bid, open_interest, vwap, is_mean_bracket, sell_order_id, entry_fee, exit_fee, slippage)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             entry_price, sell_target, order_id, paper, volume, run_id, yes_bid, open_interest, vwap, is_mean_bracket, sell_order_id, entry_fee, exit_fee, slippage,
+             price_2h_before_entry, price_4h_before_entry, price_6h_before_entry)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
         trade["series_ticker"],
         trade["market_ticker"],
@@ -1584,6 +1620,9 @@ def record_trade(trade: dict) -> int:
         trade.get("entry_fee"),
         trade.get("exit_fee"),
         trade.get("slippage"),
+        trade.get("price_2h_before_entry"),
+        trade.get("price_4h_before_entry"),
+        trade.get("price_6h_before_entry"),
     ))
     conn.commit()
     rowid = cur.lastrowid

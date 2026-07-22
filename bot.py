@@ -113,7 +113,7 @@ current_run_id: int = 0
 watchlist_is_valid: bool = False
 cycle_spent: float = 0.0
 last_cycle_at: datetime | None = None
-trading_paused: bool = TRADING_PAUSED
+trading_paused: bool = False
 
 # vwap_cache: dict = {}
 # VWAP_CACHE_TTL_MINUTES = 15
@@ -1598,6 +1598,29 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_price_history_ticker_time
         ON price_history (market_ticker, observed_at)
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS bot_state (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def get_state(key: str, default: str = "") -> str:
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT value FROM bot_state WHERE key=?", (key,)).fetchone()
+    conn.close()
+    return row[0] if row else default
+
+
+def set_state(key: str, value: str) -> None:
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT OR REPLACE INTO bot_state (key, value) VALUES (?,?)",
+        (key, value),
+    )
     conn.commit()
     conn.close()
 
@@ -2432,6 +2455,7 @@ def handle_telegram_commands() -> None:
                 send_telegram(build_balance_report())
             elif text.startswith("/pause"):
                 trading_paused = True
+                set_state("trading_paused", "true")
                 send_telegram(
                     "⏸️ Trading PAUSED\n"
                     "New entries and top-ups are suspended.\n"
@@ -2441,6 +2465,7 @@ def handle_telegram_commands() -> None:
                 log.info("Trading paused via Telegram command")
             elif text.startswith("/resume"):
                 trading_paused = False
+                set_state("trading_paused", "false")
                 send_telegram(
                     "▶️ Trading RESUMED\n"
                     "New entries and top-ups are active again."
@@ -2583,9 +2608,12 @@ def _scheduled_watchlist_monitor():
 
 
 def main():
-    global watchlist, watchlist_is_valid, open_positions, current_run_id
+    global watchlist, watchlist_is_valid, open_positions, current_run_id, trading_paused
 
     init_db()
+    trading_paused = get_state("trading_paused", "false") == "true"
+    if trading_paused:
+        log.info("Resuming in PAUSED state from previous session")
     current_run_id = get_or_create_run()
     open_positions = load_open_positions()
     log.info(f"Loaded {len(open_positions)} open positions from DB")

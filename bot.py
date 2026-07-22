@@ -723,6 +723,7 @@ def place_trade(
     is_mean_bracket: bool = False,
     remaining_budget: float | None = None,
     open_time: str | None = None,
+    rank: int | None = None,
 ) -> None:
     global cycle_spent, paper_balance
 
@@ -773,7 +774,7 @@ def place_trade(
         send_telegram(
             f"💰 Trade placed [PAPER]\n"
             f"{series_ticker} | {event_date} | {bracket_label}\n"
-            f"Entry: ${yes_ask:.2f} | Qty: {contracts} "
+            f"Rank: #{rank} | Entry: ${yes_ask:.2f} | Qty: {contracts} "
             f"(${contracts * yes_ask:.2f}) | Holding to settlement"
         )
         return
@@ -897,7 +898,7 @@ def place_trade(
     send_telegram(
         f"💰 Trade placed [LIVE]\n"
         f"{series_ticker} | {event_date} | {bracket_label}\n"
-        f"Entry: ${actual_fill_price:.2f} | Qty: {filled_qty} "
+        f"Rank: #{rank} | Entry: ${actual_fill_price:.2f} | Qty: {filled_qty} "
         f"(${filled_qty * actual_fill_price:.2f}) | Holding to settlement"
     )
 
@@ -1132,6 +1133,7 @@ def run_watchlist_monitor() -> None:
                     is_mean_bracket=(rank == 1),
                     remaining_budget=remaining_budget,
                     open_time=open_time,
+                    rank=bracket.get("rank"),
                 )
             else:
                 ask_str = f"{yes_ask:.2f}" if yes_ask is not None else "N/A"

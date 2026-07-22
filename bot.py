@@ -52,15 +52,13 @@ KALSHI_API_KEY         = os.getenv("KALSHI_API_KEY") or os.getenv("KALSHI_API_KE
 KALSHI_PRIVATE_KEY_PEM = os.getenv("KALSHI_PRIVATE_KEY_PEM", "")
 KALSHI_BASE_URL        = os.getenv("KALSHI_BASE_URL", "https://trading-api.kalshi.com/trade-api/v2")
 PAPER_TRADING          = os.getenv("PAPER_TRADING", "true").lower() == "true"
-TRADE_AMOUNT_CENTS     = int(os.getenv("TRADE_AMOUNT_CENTS", "400"))
-TRADE_AMOUNT_CENTS_EARLY = int(os.getenv("TRADE_AMOUNT_CENTS_EARLY", "200"))
-TRADE_AMOUNT_CENTS_LATE  = int(os.getenv("TRADE_AMOUNT_CENTS_LATE", "400"))
-EARLY_PHASE_HOURS        = int(os.getenv("EARLY_PHASE_HOURS", "6"))
+PAPER_STARTING_BALANCE = float(os.getenv("PAPER_STARTING_BALANCE", "500.00"))
+TRADE_AMOUNT_CENTS     = int(os.getenv("TRADE_AMOUNT_CENTS", "500"))
 TELEGRAM_BOT_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID       = os.getenv("TELEGRAM_CHAT_ID", "")
 
-ENTRY_CAP        = float(os.getenv("ENTRY_CAP", "0.12"))
-ENTRY_FLOOR      = float(os.getenv("ENTRY_FLOOR", "0.02"))
+ENTRY_CAP        = float(os.getenv("ENTRY_CAP", "0.35"))
+ENTRY_FLOOR      = float(os.getenv("ENTRY_FLOOR", "0.20"))
 WATCHLIST_SIZE   = int(os.getenv("WATCHLIST_SIZE", "3"))
 VWAP_MIN_RATIO   = float(os.getenv("VWAP_MIN_RATIO", "0.85"))
 OI_MIN           = float(os.getenv("OI_MIN", "5"))
@@ -76,13 +74,6 @@ MIN_WALLET_BALANCE = float(os.getenv("MIN_WALLET_BALANCE", "50.00"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "999"))
 ENABLED_SERIES     = os.getenv("ENABLED_SERIES", "")
 SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "2"))
-LOW_CONVERGENCE_LOCAL_HOUR_ET  = int(os.getenv("LOW_CONVERGENCE_LOCAL_HOUR_ET", "6"))
-LOW_CONVERGENCE_LOCAL_HOUR_CT  = int(os.getenv("LOW_CONVERGENCE_LOCAL_HOUR_CT", "6"))
-LOW_CONVERGENCE_LOCAL_HOUR_MT  = int(os.getenv("LOW_CONVERGENCE_LOCAL_HOUR_MT", "6"))
-LOW_CONVERGENCE_LOCAL_HOUR_PT  = int(os.getenv("LOW_CONVERGENCE_LOCAL_HOUR_PT", "14"))
-HIGH_CONVERGENCE_LOCAL_HOUR    = int(os.getenv("HIGH_CONVERGENCE_LOCAL_HOUR", "19"))
-CONVERGENCE_MIN_SIZE = int(os.getenv("CONVERGENCE_MIN_SIZE", "200"))
-CONVERGENCE_TARGET   = float(os.getenv("CONVERGENCE_TARGET", "0.93"))
 TRADING_PAUSED = os.getenv("TRADING_PAUSED", "false").lower() == "true"
 
 EASTERN = ZoneInfo("America/New_York")
@@ -112,6 +103,7 @@ telegram_offset: int = 0
 current_run_id: int = 0
 watchlist_is_valid: bool = False
 cycle_spent: float = 0.0
+paper_balance: float = PAPER_STARTING_BALANCE
 last_cycle_at: datetime | None = None
 trading_paused: bool = False
 
@@ -608,54 +600,6 @@ def get_sell_target(entry_price: float) -> float:
     return TARGET_TIER_6
 
 
-def get_convergence_hour(series_ticker: str) -> int:
-    temp_type = "HIGH" if "HIGH" in series_ticker else "LOW"
-    if temp_type == "HIGH":
-        return HIGH_CONVERGENCE_LOCAL_HOUR
-    tz_str = SERIES_CONFIG.get(series_ticker, {}).get("timezone", "America/New_York")
-    if tz_str == "America/New_York":
-        return LOW_CONVERGENCE_LOCAL_HOUR_ET
-    if tz_str == "America/Chicago":
-        return LOW_CONVERGENCE_LOCAL_HOUR_CT
-    if tz_str in ("America/Denver", "America/Phoenix"):
-        return LOW_CONVERGENCE_LOCAL_HOUR_MT
-    if tz_str == "America/Los_Angeles":
-        return LOW_CONVERGENCE_LOCAL_HOUR_PT
-    return LOW_CONVERGENCE_LOCAL_HOUR_ET
-
-
-def is_convergence_active(series_ticker: str, market_ticker: str) -> bool:
-    parts = market_ticker.split("-")
-    if len(parts) < 2:
-        return False
-    try:
-        event_dt = datetime.strptime(parts[1].upper(), "%y%b%d")
-    except ValueError:
-        return False
-
-    tz_str = SERIES_CONFIG.get(series_ticker, {}).get("timezone", "America/New_York")
-    local_now = datetime.now(tz=ZoneInfo(tz_str))
-    local_today = local_now.date()
-    if event_dt.date() != local_today:
-        return False
-
-    if local_now.hour >= get_convergence_hour(series_ticker):
-        return True
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        row = conn.execute("""
-            SELECT 1 FROM trades
-            WHERE market_ticker = ? AND run_id = ? AND sell_target = ?
-            LIMIT 1
-        """, (market_ticker, current_run_id, CONVERGENCE_TARGET)).fetchone()
-        conn.close()
-        if row:
-            return True
-    except Exception as e:
-        log.debug(f"is_convergence_active DB check failed for {market_ticker}: {e}")
-    return False
-
-
 def calc_taker_fee(price: float, contracts: int) -> float:
     return 0.07 * price * (1 - price) * contracts
 
@@ -682,48 +626,24 @@ def fetch_wallet_balance() -> float | None:
         return None
 
 
-def get_trade_amount_cents(market_open_time: str | None = None) -> int:
-    now = datetime.now(tz=UTC)
-    if not market_open_time:
-        log.debug("get_trade_amount_cents: no market open_time, falling back to 14:00 UTC anchor")
-        market_open_today = now.replace(hour=14, minute=0, second=0, microsecond=0)
-        if now < market_open_today:
-            market_open_today -= timedelta(days=1)
-        open_dt = market_open_today
-    else:
-        try:
-            open_dt = datetime.fromisoformat(str(market_open_time).replace("Z", "+00:00"))
-            if open_dt.tzinfo is None:
-                open_dt = open_dt.replace(tzinfo=UTC)
-            open_dt = open_dt.astimezone(UTC)
-        except (ValueError, TypeError) as e:
-            log.warning(
-                f"get_trade_amount_cents: could not parse open_time={market_open_time!r}: {e} "
-                f"— falling back to 14:00 UTC anchor"
-            )
-            market_open_today = now.replace(hour=14, minute=0, second=0, microsecond=0)
-            if now < market_open_today:
-                market_open_today -= timedelta(days=1)
-            open_dt = market_open_today
-
-    hours_since_open = (now - open_dt).total_seconds() / 3600
-    early = hours_since_open < EARLY_PHASE_HOURS
-    amount = TRADE_AMOUNT_CENTS_EARLY if early else TRADE_AMOUNT_CENTS_LATE
-    log.debug(
-        f"Trade size: {'EARLY' if early else 'LATE'} "
-        f"({hours_since_open:.1f}h since market open) = ${amount / 100:.2f}"
-    )
-    return amount
-
-
 def can_place_trade() -> bool:
-    if not PAPER_TRADING:
+    trade_cost = TRADE_AMOUNT_CENTS / 100
+
+    if PAPER_TRADING:
+        projected = paper_balance - cycle_spent - trade_cost
+        if projected < MIN_WALLET_BALANCE:
+            log.info(
+                f"Paper wallet guard: paper_balance=${paper_balance:.2f} "
+                f"cycle_spent=${cycle_spent:.2f} trade_cost=${trade_cost:.2f} "
+                f"projected=${projected:.2f} — skipping"
+            )
+            return False
+    else:
         balance = fetch_wallet_balance()
         if balance is None:
             log.warning("Wallet guard: could not fetch balance — skipping trade")
             return False
 
-        trade_cost = get_trade_amount_cents() / 100
         projected_balance = balance - cycle_spent - trade_cost
         if projected_balance < MIN_WALLET_BALANCE:
             log.info(
@@ -781,21 +701,13 @@ def should_top_up(ticker: str, open_time: str | None = None) -> tuple[bool, floa
         SELECT entry_price, volume FROM trades
         WHERE market_ticker = ? AND exit_price IS NULL AND run_id = ?
     """, (ticker, current_run_id)).fetchall()
-    sell_target_row = conn.execute("""
-        SELECT sell_target FROM trades
-        WHERE market_ticker = ? AND exit_price IS NULL AND run_id = ?
-        LIMIT 1
-    """, (ticker, current_run_id)).fetchone()
     conn.close()
 
     existing_cost_basis = sum(
         (entry_price or 0) * (float(volume) if volume else 0)
         for entry_price, volume in rows
     )
-    if sell_target_row and sell_target_row[0] == CONVERGENCE_TARGET:
-        target_size = CONVERGENCE_MIN_SIZE / 100
-    else:
-        target_size = get_trade_amount_cents(open_time) / 100
+    target_size = TRADE_AMOUNT_CENTS / 100
     remaining_budget = target_size - existing_cost_basis
     if remaining_budget < 0.50:
         return (False, 0.0)
@@ -812,48 +724,39 @@ def place_trade(
     remaining_budget: float | None = None,
     open_time: str | None = None,
 ) -> None:
-    global cycle_spent
+    global cycle_spent, paper_balance
 
     if not can_place_trade():
         return
 
     ticker        = bracket["ticker"]
     bracket_label = bracket["bracket_label"]
-    trade_dollars = get_trade_amount_cents(open_time) / 100
+    trade_dollars = TRADE_AMOUNT_CENTS / 100
+    event_date    = parse_event_date(ticker)
 
     if PAPER_TRADING and ticker in open_positions:
         return
 
     if PAPER_TRADING:
-        sell_target = get_sell_target(yes_ask)
-        if is_convergence_active(series_ticker, ticker):
-            original_target = sell_target
-            sell_target = CONVERGENCE_TARGET
-            log.info(
-                f"Convergence active for {ticker} — using target "
-                f"${CONVERGENCE_TARGET:.2f} instead of ${original_target:.2f}"
-            )
         order_id = f"PAPER-{int(time.time())}"
-        log.info(
-            f"[PAPER] BUY {series_ticker} {bracket_label} @ {yes_ask:.2f} "
-            f"| target sell @ {sell_target:.2f}"
-        )
-        log.info(f"[PAPER] SELL order placed @ {sell_target:.2f}")
-        volume        = float(market.get("volume_fp", 0) or 0)
         yes_bid       = float(market.get("yes_bid_dollars", 0) or 0)
         open_interest = float(market.get("open_interest_fp", 0) or 0)
         contracts  = int(trade_dollars / yes_ask)
         entry_fee  = calc_taker_fee(yes_ask, contracts)
         slippage   = 0.0
+        log.info(
+            f"[PAPER] BUY {series_ticker} {bracket_label} @ {yes_ask:.2f} "
+            f"| holding to settlement | qty {contracts}"
+        )
         if record_trade({
             "series_ticker": series_ticker,
             "market_ticker": ticker,
             "bracket_label": bracket_label,
             "side":          "YES",
             "entry_price":   yes_ask,
-            "sell_target":   sell_target,
+            "sell_target":   0.00,
             "order_id":      order_id,
-            "volume":        volume,
+            "volume":        contracts,
             "yes_bid":       yes_bid,
             "open_interest": open_interest,
             "vwap":          vwap,
@@ -861,21 +764,20 @@ def place_trade(
             "entry_fee":     entry_fee,
             "slippage":      slippage,
         }):
-            cycle_spent += trade_dollars
+            paper_balance -= TRADE_AMOUNT_CENTS / 100
         open_positions[ticker] = {
             "entry":    yes_ask,
-            "target":   sell_target,
+            "target":   0.00,
             "order_id": order_id,
         }
         send_telegram(
             f"💰 Trade placed [PAPER]\n"
-            f"{series_ticker} | {parse_event_date(ticker)} | {bracket_label}\n"
-            f"Entry: ${yes_ask:.2f} | Target: ${sell_target:.2f}"
+            f"{series_ticker} | {event_date} | {bracket_label}\n"
+            f"Entry: ${yes_ask:.2f} | Qty: {contracts} "
+            f"(${contracts * yes_ask:.2f}) | Holding to settlement"
         )
         return
 
-    existing_rows: list = []
-    top_up_buy_depth: float | None = None
     try:
         buy_dollars = remaining_budget if remaining_budget is not None else trade_dollars
         contracts_to_buy = buy_dollars / yes_ask
@@ -888,36 +790,6 @@ def place_trade(
             ORDER BY id DESC
         """, (ticker, current_run_id)).fetchall()
         conn.close()
-
-        if existing_rows:
-            existing_cost_basis = sum(
-                (row[1] or 0) * (float(row[2]) if row[2] else 0)
-                for row in existing_rows
-            )
-            existing_total_contracts = sum(
-                float(row[2]) if row[2] else 0 for row in existing_rows
-            )
-            new_total_contracts = existing_total_contracts + contracts_to_buy
-            projected_blended_entry = (
-                (existing_cost_basis + (contracts_to_buy * yes_ask)) / new_total_contracts
-            )
-            new_sell_target = get_sell_target(projected_blended_entry)
-            if is_convergence_active(series_ticker, ticker):
-                original_target = new_sell_target
-                new_sell_target = CONVERGENCE_TARGET
-                log.info(
-                    f"Convergence active for {ticker} — using target "
-                    f"${CONVERGENCE_TARGET:.2f} instead of ${original_target:.2f}"
-                )
-            buy_depth = get_yes_buy_depth(ticker, new_sell_target)
-            if buy_depth < new_total_contracts:
-                log.info(
-                    f"Top-up orderbook gate: {ticker} buy_depth={buy_depth:.1f} "
-                    f"< new_total={new_total_contracts:.1f} at target={new_sell_target:.2f} "
-                    f"— skipping top-up"
-                )
-                return
-            top_up_buy_depth = buy_depth
 
         buy_resp = kalshi_post("/portfolio/events/orders", {
             "ticker":                     ticker,
@@ -950,66 +822,14 @@ def place_trade(
             new_blended_entry = (
                 (existing_cost_basis + (filled_qty * actual_fill_price)) / new_total_contracts
             )
-            new_sell_target = get_sell_target(new_blended_entry)
-            if is_convergence_active(series_ticker, ticker):
-                original_target = new_sell_target
-                new_sell_target = CONVERGENCE_TARGET
-                log.info(
-                    f"Convergence active for {ticker} — using target "
-                    f"${CONVERGENCE_TARGET:.2f} instead of ${original_target:.2f}"
-                )
-
-            for row in existing_rows:
-                prior_sell_id = row[3]
-                if prior_sell_id:
-                    try:
-                        if not cancel_order(prior_sell_id):
-                            log.warning(f"Failed to cancel sell order {prior_sell_id} for {ticker}")
-                    except Exception as e:
-                        log.warning(f"Failed to cancel sell order {prior_sell_id} for {ticker}: {e}")
-
-            sell_resp = kalshi_post("/portfolio/events/orders", {
-                "ticker":                     ticker,
-                "client_order_id":            str(uuid.uuid4()),
-                "side":                       "ask",
-                "count":                      f"{new_total_contracts:.2f}",
-                "price":                      f"{new_sell_target:.4f}",
-                "time_in_force":              "good_till_canceled",
-                "self_trade_prevention_type": "taker_at_cross",
-            })
-            sell_order_id = sell_resp.get("order_id", "UNKNOWN")
             log.info(
                 f"[LIVE] TOP-UP BUY {series_ticker} {bracket_label} @ {actual_fill_price:.2f} "
-                f"| order {order_id}"
-            )
-            log.info(
-                f"[LIVE] SELL order replaced @ {new_sell_target:.2f} | "
-                f"qty {new_total_contracts:.0f} | order {sell_order_id}"
+                f"| order {order_id} | holding to settlement"
             )
         else:
-            sell_target = get_sell_target(actual_fill_price)
-            if is_convergence_active(series_ticker, ticker):
-                original_target = sell_target
-                sell_target = CONVERGENCE_TARGET
-                log.info(
-                    f"Convergence active for {ticker} — using target "
-                    f"${CONVERGENCE_TARGET:.2f} instead of ${original_target:.2f}"
-                )
-            sell_resp = kalshi_post("/portfolio/events/orders", {
-                "ticker":                     ticker,
-                "client_order_id":            str(uuid.uuid4()),
-                "side":                       "ask",
-                "count":                      f"{filled_qty}.00",
-                "price":                      f"{sell_target:.4f}",
-                "time_in_force":              "good_till_canceled",
-                "self_trade_prevention_type": "taker_at_cross",
-            })
-            sell_order_id = sell_resp.get("order_id", "UNKNOWN")
             log.info(
-                f"[LIVE] BUY {series_ticker} {bracket_label} @ {actual_fill_price:.2f} | order {order_id}"
-            )
-            log.info(
-                f"[LIVE] SELL order placed @ {sell_target:.2f} | qty {filled_qty} | order {sell_order_id}"
+                f"[LIVE] BUY {series_ticker} {bracket_label} @ {actual_fill_price:.2f} "
+                f"| order {order_id} | holding to settlement | qty {filled_qty}"
             )
     except Exception as e:
         log.error(f"Order failed for {ticker}: {e}")
@@ -1017,7 +837,6 @@ def place_trade(
 
     yes_bid       = float(market.get("yes_bid_dollars", 0) or 0)
     open_interest = float(market.get("open_interest_fp", 0) or 0)
-    event_date    = parse_event_date(ticker)
     incremental_entry_fee = calc_taker_fee(actual_fill_price, filled_qty)
     slippage      = actual_fill_price - yes_ask
     target_position_size = trade_dollars
@@ -1029,27 +848,26 @@ def place_trade(
         conn = sqlite3.connect(DB_PATH)
         conn.execute("""
             UPDATE trades
-            SET entry_price = ?, sell_target = ?, volume = ?, sell_order_id = ?, entry_fee = ?
+            SET entry_price = ?, sell_target = ?, volume = ?, sell_order_id = NULL, entry_fee = ?
             WHERE id = ?
         """, (
-            new_blended_entry, new_sell_target, new_total_contracts,
-            sell_order_id, cumulative_entry_fee, trade_id,
+            new_blended_entry, 0.00, new_total_contracts,
+            cumulative_entry_fee, trade_id,
         ))
         conn.commit()
         conn.close()
         cycle_spent += filled_qty * actual_fill_price
         open_positions[ticker] = {
             "entry":    new_blended_entry,
-            "target":   new_sell_target,
+            "target":   0.00,
             "order_id": order_id,
         }
         send_telegram(
             f"🔼 Topped up [LIVE]\n"
             f"{series_ticker} | {event_date} | {bracket_label}\n"
-            f"New blended entry: ${new_blended_entry:.3f} | New target: ${new_sell_target:.2f} | "
+            f"New blended entry: ${new_blended_entry:.3f} | "
             f"Total qty: {new_total_contracts:.0f} (${new_total_contracts * new_blended_entry:.2f} of "
-            f"${target_position_size:.2f} target)\n"
-            f"Book depth at target: {top_up_buy_depth:.0f} contracts"
+            f"${target_position_size:.2f} target) | Holding to settlement"
         )
         return
 
@@ -1059,9 +877,9 @@ def place_trade(
         "bracket_label": bracket_label,
         "side":          "YES",
         "entry_price":   actual_fill_price,
-        "sell_target":   sell_target,
+        "sell_target":   0.00,
         "order_id":      order_id,
-        "sell_order_id": sell_order_id,
+        "sell_order_id": None,
         "volume":        filled_qty,
         "yes_bid":       yes_bid,
         "open_interest": open_interest,
@@ -1073,15 +891,16 @@ def place_trade(
         cycle_spent += trade_dollars
     open_positions[ticker] = {
         "entry":    actual_fill_price,
-        "target":   sell_target,
+        "target":   0.00,
         "order_id": order_id,
     }
     send_telegram(
         f"💰 Trade placed [LIVE]\n"
         f"{series_ticker} | {event_date} | {bracket_label}\n"
-        f"Entry: ${actual_fill_price:.2f} | Target: ${sell_target:.2f} | "
-        f"Qty: {filled_qty} (${filled_qty * actual_fill_price:.2f})"
+        f"Entry: ${actual_fill_price:.2f} | Qty: {filled_qty} "
+        f"(${filled_qty * actual_fill_price:.2f}) | Holding to settlement"
     )
+
 
 
 def is_valid_top3(scored: list[tuple[float, dict]]) -> bool:
@@ -1301,7 +1120,7 @@ def run_watchlist_monitor() -> None:
                         continue
 
                 log.info(
-                    f"DIP DETECTED [rank {rank}]: {series_ticker} | {event_date} | "
+                    f"ENTRY SIGNAL [rank {rank}]: {series_ticker} | {event_date} | "
                     f"{bracket_label} yes_ask={yes_ask:.2f} bid={yes_bid:.2f}"
                 )
                 place_trade(
@@ -1886,15 +1705,17 @@ def reconcile_positions() -> None:
 
 
 def check_fills() -> None:
+    global paper_balance
+
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute("""
-        SELECT id, series_ticker, market_ticker, bracket_label, entry_price, sell_target, entry_fee, volume
+        SELECT id, series_ticker, market_ticker, bracket_label, entry_price, entry_fee, volume, paper
         FROM trades
-        WHERE exit_price IS NULL AND paper = 1 AND run_id = ?
+        WHERE exit_price IS NULL AND run_id = ?
     """, (current_run_id,)).fetchall()
     conn.close()
 
-    for trade_id, series_ticker, market_ticker, bracket_label, entry_price, sell_target, entry_fee, volume in rows:
+    for trade_id, series_ticker, market_ticker, bracket_label, entry_price, entry_fee, volume, paper in rows:
         entry_fee = entry_fee or 0.0
         try:
             data   = kalshi_get(f"/markets/{market_ticker}")
@@ -1905,7 +1726,7 @@ def check_fills() -> None:
             continue
 
         status = market.get("status", "")
-        mode_label = "PAPER" if PAPER_TRADING else "LIVE"
+        mode_label = "PAPER" if paper else "LIVE"
         event_date = parse_event_date(market_ticker)
         if status in ("settled", "finalized"):
             win        = market.get("result", "") == "yes"
@@ -1914,6 +1735,9 @@ def check_fills() -> None:
             exit_fee = calc_maker_fee(exit_price, _fee_contract_count(volume, entry_price))
             close_trade(trade_id, exit_price, exit_reason, exit_fee=exit_fee)
             open_positions.pop(market_ticker, None)
+            if paper and win:
+                contracts = float(volume) if volume else 0.0
+                paper_balance += exit_price * contracts
             pnl = _trade_pnl(
                 entry_price, exit_price,
                 entry_fee=entry_fee, exit_fee=exit_fee,
@@ -1931,194 +1755,10 @@ def check_fills() -> None:
                     f"{series_ticker} | {event_date} | {bracket_label}\n"
                     f"PnL: -${abs(pnl):.2f}"
                 )
-            time.sleep(0.25)
-            continue
-
-        try:
-            last_price = float(market.get("last_price_dollars") or 0)
-        except (TypeError, ValueError):
-            last_price = 0.0
-
-        if last_price > 0 and last_price >= sell_target:
-            exit_fee = calc_maker_fee(sell_target, _fee_contract_count(volume, entry_price))
-            close_trade(trade_id, sell_target, "SELL_TARGET", exit_fee=exit_fee)
-            open_positions.pop(market_ticker, None)
-            pnl = _trade_pnl(
-                entry_price, sell_target,
-                entry_fee=entry_fee, exit_fee=exit_fee,
-                contracts=_contracts_from_volume(volume),
-            )
-            send_telegram(
-                f"🎯 Target hit! [{mode_label}]\n"
-                f"{series_ticker} | {event_date} | {bracket_label}\n"
-                f"${entry_price:.2f} → ${sell_target:.2f} | PnL: +${pnl:.2f}"
-            )
 
         time.sleep(0.25)
 
-    if not PAPER_TRADING:
-        conn = sqlite3.connect(DB_PATH)
-        live_rows = conn.execute("""
-            SELECT id, series_ticker, market_ticker, bracket_label, entry_price, sell_target,
-                   sell_order_id, entry_fee, volume, last_known_fill_count, realized_pnl
-            FROM trades
-            WHERE exit_price IS NULL AND paper = 0 AND run_id = ? AND sell_order_id IS NOT NULL
-        """, (current_run_id,)).fetchall()
-        conn.close()
 
-        for (
-            trade_id, series_ticker, market_ticker, bracket_label,
-            entry_price, sell_target, sell_order_id, entry_fee, volume,
-            last_known_fill_count, realized_pnl,
-        ) in live_rows:
-            entry_fee = entry_fee or 0.0
-            last_known_fill_count = float(last_known_fill_count or 0.0)
-            realized_pnl = float(realized_pnl or 0.0)
-            fee_contracts = _fee_contract_count(volume, entry_price)
-            event_date = parse_event_date(market_ticker)
-            try:
-                data  = kalshi_get(f"/portfolio/orders/{sell_order_id}")
-                order = data.get("order") or data
-            except Exception as e:
-                log.warning(f"check_fills: sell order fetch failed for {market_ticker}: {e}")
-                time.sleep(0.25)
-                continue
-
-            status = order.get("status", "")
-            current_fill_count = float(order.get("fill_count_fp", 0) or 0)
-            newly_filled = current_fill_count - last_known_fill_count
-
-            if status == "executed":
-                exit_price = get_polled_exit_price(order)
-                if exit_price is None:
-                    exit_price = sell_target
-                total_contracts_sold = last_known_fill_count + newly_filled
-                exit_fee = calc_maker_fee(exit_price, int(total_contracts_sold))
-                final_pnl = _trade_pnl(
-                    entry_price, exit_price,
-                    entry_fee=entry_fee,
-                    exit_fee=exit_fee,
-                    contracts=total_contracts_sold,
-                )
-                total_pnl = realized_pnl + final_pnl
-                close_trade(trade_id, exit_price, "SELL_TARGET", exit_fee=exit_fee)
-                open_positions.pop(market_ticker, None)
-                send_telegram(
-                    f"🎯 Target hit! [LIVE]\n"
-                    f"{series_ticker} | {event_date} | {bracket_label}\n"
-                    f"${entry_price:.2f} → ${exit_price:.2f} | PnL: +${total_pnl:.2f}"
-                )
-            elif newly_filled > 0:
-                partial_pnl = _trade_pnl(
-                    entry_price, sell_target,
-                    entry_fee=0,
-                    exit_fee=calc_maker_fee(sell_target, int(newly_filled)),
-                    contracts=newly_filled,
-                )
-                remaining_count = float(order.get("remaining_count_fp", 0) or 0)
-                total_order_contracts = current_fill_count + remaining_count
-                send_telegram(
-                    f"🎯 Partial fill [LIVE]\n"
-                    f"{series_ticker} | {event_date} | {bracket_label}\n"
-                    f"${entry_price:.2f} → ${sell_target:.2f} | Sold {newly_filled:.0f} of "
-                    f"{total_order_contracts:.0f} | "
-                    f"Partial PnL: +${partial_pnl:.2f}"
-                )
-                new_volume = float(volume or 0) - newly_filled
-                conn = sqlite3.connect(DB_PATH)
-                conn.execute("""
-                    UPDATE trades
-                    SET last_known_fill_count = ?, volume = ?, realized_pnl = ?
-                    WHERE id = ?
-                """, (
-                    current_fill_count, new_volume, realized_pnl + partial_pnl, trade_id,
-                ))
-                conn.commit()
-                conn.close()
-            elif status in ("cancelled", "expired", "canceled"):
-                try:
-                    market_data = kalshi_get(f"/markets/{market_ticker}")
-                    market = market_data.get("market", {})
-                except Exception as e:
-                    log.warning(
-                        f"check_fills: market fetch failed for expired sell on {market_ticker}: {e}"
-                    )
-                    time.sleep(0.25)
-                    continue
-
-                market_status = market.get("status", "")
-
-                if market_status in ("settled", "finalized"):
-                    win = market.get("result", "") == "yes"
-                    exit_price = 1.00 if win else 0.00
-                    exit_fee = calc_maker_fee(exit_price, fee_contracts)
-                    close_trade(trade_id, exit_price, "RECONCILED_SETTLEMENT", exit_fee=exit_fee)
-                    open_positions.pop(market_ticker, None)
-                    pnl = _trade_pnl(
-                        entry_price, exit_price,
-                        entry_fee=entry_fee, exit_fee=exit_fee,
-                        contracts=fee_contracts,
-                    )
-                    if win:
-                        send_telegram(
-                            f"✅ Settled WIN [LIVE]\n"
-                            f"{series_ticker} | {event_date} | {bracket_label}\n"
-                            f"PnL: +${pnl:.2f}"
-                        )
-                    else:
-                        send_telegram(
-                            f"❌ Settled LOSS [LIVE]\n"
-                            f"{series_ticker} | {event_date} | {bracket_label}\n"
-                            f"PnL: -${abs(pnl):.2f}"
-                        )
-                    time.sleep(0.25)
-                    continue
-
-                elif market_status == "closed":
-                    log.info(
-                        f"Sell order expired, market closed awaiting settlement: "
-                        f"{market_ticker} — will check again next cycle"
-                    )
-                    time.sleep(0.25)
-                    continue
-
-                else:
-                    yes_ask = get_yes_ask(market)
-                    recovery_target = get_sell_target(entry_price)
-                    try:
-                        sell_resp = kalshi_post("/portfolio/events/orders", {
-                            "ticker":                     market_ticker,
-                            "client_order_id":            str(uuid.uuid4()),
-                            "side":                       "ask",
-                            "count":                      f"{fee_contracts}.00",
-                            "price":                      f"{recovery_target:.4f}",
-                            "time_in_force":              "good_till_canceled",
-                            "self_trade_prevention_type": "taker_at_cross",
-                        })
-                        new_order_id = sell_resp.get("order_id", "UNKNOWN")
-                        conn = sqlite3.connect(DB_PATH)
-                        conn.execute(
-                            "UPDATE trades SET sell_order_id = ? WHERE id = ?",
-                            (new_order_id, trade_id),
-                        )
-                        conn.commit()
-                        conn.close()
-                        log.info(
-                            f"Replaced expired sell for {market_ticker} → new order {new_order_id}"
-                        )
-                        send_telegram(
-                            f"🔄 Replaced expired sell order\n"
-                            f"{market_ticker} target: ${recovery_target:.2f}"
-                        )
-                    except Exception as e:
-                        log.warning(
-                            f"Failed to replace sell order for {market_ticker}: {e} — "
-                            f"will retry next cycle"
-                        )
-                    time.sleep(0.25)
-                    continue
-
-            time.sleep(0.25)
 
 # ---------------------------------------------------------------------------
 # Telegram
@@ -2181,14 +1821,12 @@ def send_daily_summary() -> None:
 
     conn.close()
 
-    target_hits = sum(1 for r in recent_closed if r["exit_reason"] == "SELL_TARGET")
     settled_wins = sum(1 for r in recent_closed if r["exit_reason"] == "SETTLED_WIN")
     settled_losses = sum(1 for r in recent_closed if r["exit_reason"] == "SETTLED_LOSS")
     pnl_str = f"+${total_pnl:.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):.2f}"
 
     send_telegram(
         f"📅 Daily Summary | {datetime.now(tz=UTC).strftime('%b %d')}\n"
-        f"🎯 Target hits: {target_hits}\n"
         f"✅ Settled wins: {settled_wins}\n"
         f"❌ Settled losses: {settled_losses}\n"
         f"💼 Open positions: {open_count}\n"
@@ -2291,34 +1929,28 @@ def build_telegram_dashboard() -> str:
     conn.row_factory = sqlite3.Row
 
     open_rows = conn.execute("""
-        SELECT series_ticker, market_ticker, bracket_label, entry_price, sell_target, created_at
+        SELECT series_ticker, market_ticker, bracket_label, entry_price, volume, created_at
         FROM trades
         WHERE exit_price IS NULL AND run_id = ?
         ORDER BY entry_price ASC
     """, (current_run_id,)).fetchall()
 
-    full_hits_pnl, full_hits_count = conn.execute("""
-        SELECT
-            COALESCE(SUM((exit_price - entry_price) * volume - entry_fee - COALESCE(exit_fee, 0.0)), 0.0),
-            COUNT(*)
+    settled_wins_count = conn.execute("""
+        SELECT COUNT(*)
         FROM trades
-        WHERE exit_reason = 'SELL_TARGET'
+        WHERE exit_reason = 'SETTLED_WIN'
           AND run_id = ? AND paper = 0
-    """, (current_run_id,)).fetchone()
+    """, (current_run_id,)).fetchone()[0]
 
-    partial_hits_pnl, partial_hits_count = conn.execute("""
-        SELECT
-            COALESCE(SUM(realized_pnl), 0.0),
-            COUNT(*)
+    avg_settled_win = conn.execute("""
+        SELECT COALESCE(
+            AVG((exit_price - entry_price) * volume - entry_fee - COALESCE(exit_fee, 0.0)),
+            0.0
+        )
         FROM trades
-        WHERE exit_reason != 'SELL_TARGET'
-          AND realized_pnl > 0
+        WHERE exit_reason = 'SETTLED_WIN'
           AND run_id = ? AND paper = 0
-    """, (current_run_id,)).fetchone()
-
-    total_hit_count = full_hits_count + partial_hits_count
-    total_hit_pnl = (full_hits_pnl or 0.0) + (partial_hits_pnl or 0.0)
-    avg_target_hit_pnl = total_hit_pnl / total_hit_count if total_hit_count > 0 else 0.0
+    """, (current_run_id,)).fetchone()[0] or 0.0
 
     settled_losses_count = conn.execute("""
         SELECT COUNT(*)
@@ -2327,17 +1959,6 @@ def build_telegram_dashboard() -> str:
           AND exit_reason IN ('SETTLED_LOSS', 'RECONCILED_SETTLEMENT')
           AND run_id = ? AND paper = 0
     """, (current_run_id,)).fetchone()[0]
-
-    avg_settled_loss = conn.execute("""
-        SELECT COALESCE(
-            AVG((exit_price - entry_price) * volume - entry_fee - COALESCE(exit_fee, 0.0)),
-            0.0
-        )
-        FROM trades
-        WHERE exit_price = 0.0
-          AND exit_reason IN ('SETTLED_LOSS', 'RECONCILED_SETTLEMENT')
-          AND run_id = ? AND paper = 0
-    """, (current_run_id,)).fetchone()[0] or 0.0
 
     total_pnl = conn.execute("""
         SELECT
@@ -2353,15 +1974,15 @@ def build_telegram_dashboard() -> str:
 
     now = datetime.now(tz=EASTERN)
     total_pnl_str = f"+${total_pnl:.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):.2f}"
-    total_closed = total_hit_count + settled_losses_count
-    win_rate = (total_hit_count / total_closed * 100) if total_closed > 0 else 0.0
+    total_closed = settled_wins_count + settled_losses_count
+    win_rate = (settled_wins_count / total_closed * 100) if total_closed > 0 else 0.0
 
     lines = [
-        f"📊 *Dip Bot* | Run #{current_run_id} | {now.strftime('%Y-%m-%d')} {now.strftime('%H:%M')} ET",
+        f"📊 *Hold Bot* | Run #{current_run_id} | {now.strftime('%Y-%m-%d')} {now.strftime('%H:%M')} ET",
         "",
         f"💼 Open: {len(open_rows)}",
-        f"🎯 Target hits: {total_hit_count} avg +${avg_target_hit_pnl:.2f}",
-        f"❌ Settled losses: {settled_losses_count} avg -${abs(avg_settled_loss):.2f}",
+        f"✅ Settled wins: {settled_wins_count} avg +${avg_settled_win:.2f}",
+        f"❌ Settled losses: {settled_losses_count}",
         f"📊 Win rate: {win_rate:.1f}%",
         f"💰 Total PnL: {total_pnl_str}",
         "",
@@ -2370,9 +1991,10 @@ def build_telegram_dashboard() -> str:
 
     if open_rows:
         for r in open_rows[:5]:
+            qty = float(r["volume"] or 0)
             lines.append(
                 f"{r['series_ticker']} | {parse_event_date(r['market_ticker'])} | {r['bracket_label']} "
-                f"@ {r['entry_price']:.2f} → {r['sell_target']:.2f} "
+                f"@ {r['entry_price']:.2f} qty {qty:.0f} "
                 f"({_format_position_age(r['created_at'])})"
             )
         remaining = len(open_rows) - 5
@@ -2385,12 +2007,12 @@ def build_telegram_dashboard() -> str:
 
 
 def build_balance_report() -> str:
-    cash_balance = fetch_wallet_balance()
+    cash_balance = paper_balance if PAPER_TRADING else fetch_wallet_balance()
     trade_dollars = TRADE_AMOUNT_CENTS / 100
 
     conn = sqlite3.connect(DB_PATH)
     open_rows = conn.execute("""
-        SELECT entry_price, sell_target, volume
+        SELECT entry_price, volume
         FROM trades
         WHERE exit_price IS NULL AND run_id = ?
     """, (current_run_id,)).fetchall()
@@ -2398,14 +2020,14 @@ def build_balance_report() -> str:
 
     open_count = len(open_rows)
     cost_basis = 0.0
-    total_target_value = 0.0
-    for entry_price, sell_target, volume in open_rows:
+    settlement_value = 0.0
+    for entry_price, volume in open_rows:
         if not entry_price or entry_price <= 0:
             continue
         actual_contracts = float(volume) if volume else (trade_dollars / entry_price)
         cost_basis += actual_contracts * entry_price
-        total_target_value += actual_contracts * sell_target
-    potential_profit = total_target_value - cost_basis
+        settlement_value += actual_contracts * 1.00
+    potential_profit = settlement_value - cost_basis
 
     if cash_balance is None:
         remaining_trades = 0
@@ -2416,10 +2038,11 @@ def build_balance_report() -> str:
         )
         cash_str = f"${cash_balance:.2f}"
 
+    label = "Paper Balance" if PAPER_TRADING else "Cash Balance"
     return (
-        f"💵 Cash Balance: {cash_str}\n"
+        f"💵 {label}: {cash_str}\n"
         f"📦 Open positions: {open_count} (cost basis: ${cost_basis:.2f})\n"
-        f"🎯 If all targets hit: +${potential_profit:.2f}\n"
+        f"✅ If all settle YES: +${potential_profit:.2f}\n"
         f"🔫 Remaining capacity: {remaining_trades} more trades before ${MIN_WALLET_BALANCE:.0f} floor"
     )
 
@@ -2459,7 +2082,7 @@ def handle_telegram_commands() -> None:
                 send_telegram(
                     "⏸️ Trading PAUSED\n"
                     "New entries and top-ups are suspended.\n"
-                    "Monitoring, settlements, and sell order management continue.\n"
+                    "Monitoring and settlements continue.\n"
                     "Send /resume to resume trading."
                 )
                 log.info("Trading paused via Telegram command")
@@ -2492,101 +2115,6 @@ def _scheduled_build_watchlist():
         schedule.every(5).minutes.do(_retry_watchlist_build).tag("watchlist_retry")
     watchlist_is_valid = True
 
-
-def switch_convergence_if_needed() -> None:
-    if PAPER_TRADING:
-        return
-
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute("""
-        SELECT t.id, t.market_ticker, t.series_ticker, t.bracket_label,
-               t.entry_price, t.volume, t.sell_order_id, t.entry_fee
-        FROM trades t
-        JOIN watchlist w ON w.bracket_ticker = t.market_ticker
-        WHERE t.exit_price IS NULL AND t.paper = 0 AND t.run_id = ?
-          AND t.sell_target != ?
-          AND date(w.occurrence_dt) = date('now')
-    """, (current_run_id, CONVERGENCE_TARGET)).fetchall()
-    conn.close()
-
-    high_count = 0
-    low_count = 0
-    failures = 0
-    for (
-        trade_id, market_ticker, series_ticker, bracket_label,
-        entry_price, volume, sell_order_id, entry_fee,
-    ) in rows:
-        if not is_convergence_active(series_ticker, market_ticker):
-            continue
-
-        temp_type = "HIGH" if "HIGH" in series_ticker else "LOW"
-
-        if sell_order_id:
-            try:
-                cancel_order(sell_order_id)
-            except Exception as e:
-                log.warning(
-                    f"Convergence cancel failed for {market_ticker} "
-                    f"order {sell_order_id}: {e}"
-                )
-
-        contracts = float(volume) if volume else 0.0
-        if contracts <= 0:
-            log.warning(f"Convergence skip {market_ticker}: no volume")
-            failures += 1
-            time.sleep(0.25)
-            continue
-
-        try:
-            sell_resp = kalshi_post("/portfolio/events/orders", {
-                "ticker":                     market_ticker,
-                "client_order_id":            str(uuid.uuid4()),
-                "side":                       "ask",
-                "count":                      f"{contracts:.2f}",
-                "price":                      f"{CONVERGENCE_TARGET:.4f}",
-                "time_in_force":              "good_till_canceled",
-                "self_trade_prevention_type": "taker_at_cross",
-            })
-            new_order_id = sell_resp.get("order_id", "UNKNOWN")
-            conn = sqlite3.connect(DB_PATH)
-            conn.execute("""
-                UPDATE trades
-                SET sell_target = ?, sell_order_id = ?, last_known_fill_count = 0
-                WHERE id = ?
-            """, (CONVERGENCE_TARGET, new_order_id, trade_id))
-            conn.commit()
-            conn.close()
-            if market_ticker in open_positions:
-                open_positions[market_ticker]["target"] = CONVERGENCE_TARGET
-            if temp_type == "HIGH":
-                high_count += 1
-            else:
-                low_count += 1
-            log.info(
-                f"Convergence switch [{temp_type}] {series_ticker} {bracket_label} "
-                f"{market_ticker}: qty {contracts:.0f} → ${CONVERGENCE_TARGET:.2f} "
-                f"order {new_order_id}"
-            )
-        except Exception as e:
-            failures += 1
-            log.error(f"Convergence switch failed for {market_ticker}: {e}")
-
-        time.sleep(0.25)
-
-    switched = high_count + low_count
-    log.info(
-        f"Convergence check complete: switched={switched} "
-        f"(HIGH={high_count}, LOW={low_count}) failures={failures}"
-    )
-    if switched > 0:
-        send_telegram(
-            f"🎯 Convergence switch: {high_count} HIGH, {low_count} LOW orders → "
-            f"${CONVERGENCE_TARGET:.2f}"
-        )
-
-
-def _scheduled_convergence_check():
-    switch_convergence_if_needed()
 
 
 def _retry_watchlist_build():
@@ -2621,21 +2149,10 @@ def main():
         reconcile_positions()
     log.info(f"Kalshi Market Bot | PAPER={PAPER_TRADING}")
     log.info(
-        f"Config: ENTRY_CAP={ENTRY_CAP} ENTRY_FLOOR={ENTRY_FLOOR} WATCHLIST_SIZE={WATCHLIST_SIZE} "
-        f"TARGETS={TARGET_TIER_1}/{TARGET_TIER_2}/{TARGET_TIER_3}/{TARGET_TIER_4}/{TARGET_TIER_5}/{TARGET_TIER_6}"
-    )
-    log.info(
-        f"TRADE_AMOUNT_CENTS_EARLY={TRADE_AMOUNT_CENTS_EARLY} "
-        f"TRADE_AMOUNT_CENTS_LATE={TRADE_AMOUNT_CENTS_LATE} "
-        f"EARLY_PHASE_HOURS={EARLY_PHASE_HOURS} "
-        f"LOW_CONVERGENCE_LOCAL_HOUR_ET={LOW_CONVERGENCE_LOCAL_HOUR_ET} "
-        f"LOW_CONVERGENCE_LOCAL_HOUR_CT={LOW_CONVERGENCE_LOCAL_HOUR_CT} "
-        f"LOW_CONVERGENCE_LOCAL_HOUR_MT={LOW_CONVERGENCE_LOCAL_HOUR_MT} "
-        f"LOW_CONVERGENCE_LOCAL_HOUR_PT={LOW_CONVERGENCE_LOCAL_HOUR_PT} "
-        f"HIGH_CONVERGENCE_LOCAL_HOUR={HIGH_CONVERGENCE_LOCAL_HOUR} "
-        f"CONVERGENCE_MIN_SIZE={CONVERGENCE_MIN_SIZE} "
-        f"CONVERGENCE_TARGET={CONVERGENCE_TARGET} "
-        f"TRADING_PAUSED={TRADING_PAUSED}"
+        f"Config: ENTRY_CAP={ENTRY_CAP} ENTRY_FLOOR={ENTRY_FLOOR} "
+        f"TRADE_AMOUNT_CENTS={TRADE_AMOUNT_CENTS} "
+        f"PAPER_STARTING_BALANCE={PAPER_STARTING_BALANCE} "
+        f"WATCHLIST_SIZE={WATCHLIST_SIZE} TRADING_PAUSED={TRADING_PAUSED}"
     )
     disabled = sorted(s for s, c in SERIES_CONFIG.items() if not c.get("enabled", True))
     if ENABLED_SERIES:
@@ -2703,17 +2220,14 @@ def main():
     schedule.every(SCAN_INTERVAL_MINUTES).minutes.do(_scheduled_watchlist_monitor)
     schedule.every(SCAN_INTERVAL_MINUTES).minutes.do(check_fills)
     schedule.every(SCAN_INTERVAL_MINUTES).minutes.do(run_price_history_capture)
-    schedule.every(SCAN_INTERVAL_MINUTES).minutes.do(_scheduled_convergence_check)
     schedule.every(10).minutes.do(check_health)
     schedule.every().day.at("12:00").do(send_daily_summary)
     schedule.every(5).seconds.do(handle_telegram_commands)
     log.info(
         f"Scheduled: watchlist build daily 14:05 UTC; monitor + fills + price history "
-        f"+ convergence check every {SCAN_INTERVAL_MINUTES} min; "
+        f"every {SCAN_INTERVAL_MINUTES} min; "
         "health check every 10 min; daily summary 12:00 UTC; Telegram every 5s"
     )
-
-    switch_convergence_if_needed()
 
     try:
         while True:

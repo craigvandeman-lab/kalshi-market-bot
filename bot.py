@@ -1822,10 +1822,20 @@ def send_daily_summary() -> None:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
 
-    recent_closed = conn.execute("""
-        SELECT entry_price, exit_price, entry_fee, exit_fee, exit_reason, volume
+    recent_wins = conn.execute("""
+        SELECT entry_price, exit_price, entry_fee, exit_fee, volume
         FROM trades
-        WHERE closed_at >= datetime('now', '-24 hours') AND run_id = ?
+        WHERE exit_reason = 'SETTLED_WIN'
+          AND closed_at >= datetime('now', '-24 hours')
+          AND run_id = ? AND paper = 1
+    """, (current_run_id,)).fetchall()
+
+    recent_losses = conn.execute("""
+        SELECT entry_price, exit_price, entry_fee, exit_fee, volume
+        FROM trades
+        WHERE exit_reason = 'SETTLED_LOSS'
+          AND closed_at >= datetime('now', '-24 hours')
+          AND run_id = ? AND paper = 1
     """, (current_run_id,)).fetchall()
 
     open_count = conn.execute("""
@@ -1834,36 +1844,20 @@ def send_daily_summary() -> None:
     """, (current_run_id,)).fetchone()[0]
 
     total_pnl = conn.execute("""
-        SELECT
-            COALESCE(SUM(CASE
-                WHEN closed_at >= datetime('now', '-24 hours')
-                THEN (exit_price - entry_price) * volume
-                ELSE 0
-            END), 0.0)
-            + COALESCE(SUM(CASE
-                WHEN exit_price IS NULL
-                THEN realized_pnl
-                ELSE 0
-            END), 0.0)
-            - COALESCE(SUM(CASE
-                WHEN closed_at >= datetime('now', '-24 hours')
-                THEN entry_fee
-                ELSE 0
-            END), 0.0)
-            - COALESCE(SUM(CASE
-                WHEN closed_at >= datetime('now', '-24 hours')
-                THEN COALESCE(exit_fee, 0.0)
-                ELSE 0
-            END), 0.0)
+        SELECT COALESCE(SUM(
+            (exit_price - entry_price) * volume
+            - COALESCE(entry_fee, 0) - COALESCE(exit_fee, 0)
+        ), 0.0)
         FROM trades
-        WHERE run_id = ? AND paper = 0
-          AND (closed_at >= datetime('now', '-24 hours') OR exit_price IS NULL)
+        WHERE exit_price IS NOT NULL
+          AND closed_at >= datetime('now', '-24 hours')
+          AND run_id = ? AND paper = 1
     """, (current_run_id,)).fetchone()[0] or 0.0
 
     conn.close()
 
-    settled_wins = sum(1 for r in recent_closed if r["exit_reason"] == "SETTLED_WIN")
-    settled_losses = sum(1 for r in recent_closed if r["exit_reason"] == "SETTLED_LOSS")
+    settled_wins = len(recent_wins)
+    settled_losses = len(recent_losses)
     pnl_str = f"+${total_pnl:.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):.2f}"
 
     send_telegram(
@@ -1976,42 +1970,41 @@ def build_telegram_dashboard() -> str:
         ORDER BY entry_price ASC
     """, (current_run_id,)).fetchall()
 
-    settled_wins_count = conn.execute("""
-        SELECT COUNT(*)
+    settled_wins = conn.execute("""
+        SELECT entry_price, exit_price, entry_fee, exit_fee, volume
         FROM trades
-        WHERE exit_reason = 'SETTLED_WIN'
-          AND run_id = ? AND paper = 0
-    """, (current_run_id,)).fetchone()[0]
+        WHERE exit_reason = 'SETTLED_WIN' AND run_id = ? AND paper = 1
+    """, (current_run_id,)).fetchall()
 
-    avg_settled_win = conn.execute("""
-        SELECT COALESCE(
-            AVG((exit_price - entry_price) * volume - entry_fee - COALESCE(exit_fee, 0.0)),
-            0.0
-        )
+    settled_losses = conn.execute("""
+        SELECT entry_price, exit_price, entry_fee, exit_fee, volume
         FROM trades
-        WHERE exit_reason = 'SETTLED_WIN'
-          AND run_id = ? AND paper = 0
-    """, (current_run_id,)).fetchone()[0] or 0.0
-
-    settled_losses_count = conn.execute("""
-        SELECT COUNT(*)
-        FROM trades
-        WHERE exit_price = 0.0
-          AND exit_reason IN ('SETTLED_LOSS', 'RECONCILED_SETTLEMENT')
-          AND run_id = ? AND paper = 0
-    """, (current_run_id,)).fetchone()[0]
+        WHERE exit_reason = 'SETTLED_LOSS' AND run_id = ? AND paper = 1
+    """, (current_run_id,)).fetchall()
 
     total_pnl = conn.execute("""
-        SELECT
-            COALESCE(SUM((exit_price - entry_price) * volume), 0.0)
-            + COALESCE(SUM(realized_pnl), 0.0)
-            - COALESCE(SUM(entry_fee), 0.0)
-            - COALESCE(SUM(COALESCE(exit_fee, 0.0)), 0.0)
+        SELECT COALESCE(SUM(
+            (exit_price - entry_price) * volume
+            - COALESCE(entry_fee, 0) - COALESCE(exit_fee, 0)
+        ), 0.0)
         FROM trades
-        WHERE run_id = ? AND paper = 0
+        WHERE exit_price IS NOT NULL AND run_id = ? AND paper = 1
     """, (current_run_id,)).fetchone()[0] or 0.0
 
     conn.close()
+
+    settled_wins_count = len(settled_wins)
+    settled_losses_count = len(settled_losses)
+    win_pnls = [
+        _trade_pnl(
+            r["entry_price"], r["exit_price"],
+            entry_fee=(r["entry_fee"] or 0.0),
+            exit_fee=(r["exit_fee"] or 0.0),
+            contracts=int(float(r["volume"])) if r["volume"] else None,
+        )
+        for r in settled_wins
+    ]
+    avg_win_pnl = (sum(win_pnls) / len(win_pnls)) if win_pnls else 0.0
 
     now = datetime.now(tz=EASTERN)
     total_pnl_str = f"+${total_pnl:.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):.2f}"
@@ -2022,7 +2015,7 @@ def build_telegram_dashboard() -> str:
         f"📊 *Hold Bot* | Run #{current_run_id} | {now.strftime('%Y-%m-%d')} {now.strftime('%H:%M')} ET",
         "",
         f"💼 Open: {len(open_rows)}",
-        f"✅ Settled wins: {settled_wins_count} avg +${avg_settled_win:.2f}",
+        f"✅ Settled wins: {settled_wins_count} avg +${avg_win_pnl:.2f}",
         f"❌ Settled losses: {settled_losses_count}",
         f"📊 Win rate: {win_rate:.1f}%",
         f"💰 Total PnL: {total_pnl_str}",
@@ -2061,14 +2054,13 @@ def build_balance_report() -> str:
 
     open_count = len(open_rows)
     cost_basis = 0.0
-    settlement_value = 0.0
+    potential_profit = 0.0
     for entry_price, volume in open_rows:
         if not entry_price or entry_price <= 0:
             continue
         actual_contracts = float(volume) if volume else (trade_dollars / entry_price)
         cost_basis += actual_contracts * entry_price
-        settlement_value += actual_contracts * 1.00
-    potential_profit = settlement_value - cost_basis
+        potential_profit += (1.00 - entry_price) * actual_contracts
 
     if cash_balance is None:
         remaining_trades = 0

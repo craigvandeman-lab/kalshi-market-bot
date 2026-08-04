@@ -1083,6 +1083,8 @@ def run_watchlist_monitor() -> None:
             continue
 
         for bracket in brackets:
+            if bracket.get("rank", 1) > WATCHLIST_SIZE:
+                continue
             ticker        = bracket["ticker"]
             bracket_label = bracket["bracket_label"]
             rank          = bracket["rank"]

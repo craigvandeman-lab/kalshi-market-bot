@@ -1033,25 +1033,14 @@ def try_build_watchlist() -> bool:
     wl = build_watchlist()
     enabled = {s for s, c in SERIES_CONFIG.items() if c.get("enabled", True)}
     missing = enabled - _enabled_series_in_watchlist(wl)
-    now = datetime.now(tz=UTC)
 
-    if missing and now.hour < 16:
+    if missing:
         n = len(missing)
         log.info(f"{n} series still pending watchlist selection")
         send_telegram(
             f"⏳ Watchlist incomplete: {n} series prices not differentiated yet, retrying in 5 min"
         )
         return False
-
-    if missing:
-        n = len(missing)
-        log.warning(
-            f"Watchlist finalized with {n} series skipped (prices never differentiated): "
-            f"{', '.join(sorted(missing))}"
-        )
-        send_telegram(
-            f"⚠️ Watchlist finalized with {n} series skipped (prices never differentiated)"
-        )
 
     return True
 
